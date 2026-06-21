@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>生成插件图标</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 30px;
+      background: #1a1a1a;
+      color: white;
+    }
+    button {
+      margin: 10px;
+      padding: 12px 24px;
+      background: #e53935;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: bold;
+    }
+    button:hover { background: #c62828; }
+    canvas { display: none; }
+    .tip {
+      background: #333;
+      border-radius: 8px;
+      padding: 16px;
+      margin: 16px 0;
+      font-size: 13px;
+      line-height: 2;
+      max-width: 500px;
+      text-align: left;
+    }
+    .preview {
+      display: flex;
+      gap: 20px;
+      margin: 20px 0;
+      align-items: flex-end;
+    }
+    .preview-item {
+      text-align: center;
+      font-size: 12px;
+      color: #aaa;
+    }
+  </style>
+</head>
+<body>
+  <h2>🎬 直播内录器 - 图标生成工具</h2>
+
+  <div class="tip">
+    📌 使用说明：<br>
+    1. 点击下方按钮，自动生成并下载3个图标文件<br>
+    2. 将下载的图标放入 <code>icons/</code> 文件夹<br>
+    3. 确保文件名为：icon16.png / icon48.png / icon128.png
+  </div>
+
+  <div class="preview" id="preview"></div>
+
+  <button onclick="generateAll()">🎨 一键生成全部图标</button>
+
+  <canvas id="canvas"></canvas>
+
+  <script>
+    function drawIcon(size) {
+      const canvas = document.getElementById('canvas');
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext('2d');
+
+      // 背景圆
+      const grad = ctx.createLinearGradient(0, 0, size, size);
+      grad.addColorStop(0, '#1a1a2e');
+      grad.addColorStop(1, '#16213e');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(size/2, size/2, size/2, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 红色边框
+      ctx.strokeStyle = '#e53935';
+      ctx.lineWidth = size * 0.06;
+      ctx.beginPath();
+      ctx.arc(size/2, size/2, size/2 - size*0.04, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // 录制点（红色圆）
+      const dotGrad = ctx.createRadialGradient(
+        size*0.45, size*0.45, 0,
+        size/2, size/2, size*0.28
+      );
+      dotGrad.addColorStop(0, '#ff6b6b');
+      dotGrad.addColorStop(1, '#e53935');
+      ctx.fillStyle = dotGrad;
+      ctx.beginPath();
+      ctx.arc(size/2, size/2, size * 0.28, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 高光
+      ctx.fillStyle = 'rgba(255,255,255,0.25)';
+      ctx.beginPath();
+      ctx.arc(size*0.42, size*0.40, size*0.08, 0, Math.PI * 2);
+      ctx.fill();
+
+      return canvas.toDataURL('image/png');
+    }
+
+    function generateAll() {
+      const sizes = [16, 48, 128];
+      const previewEl = document.getElementById('preview');
+      previewEl.innerHTML = '';
+
+      sizes.forEach(size => {
+        const dataUrl = drawIcon(size);
+
+        // 预览
+        const item = document.createElement('div');
+        item.className = 'preview-item';
+        const img = document.createElement('img');
+        img.src = dataUrl;
+        img.width = size;
+        img.height = size;
+        img.style.border = '1px solid #444';
+        img.style.borderRadius = '4px';
+        item.appendChild(img);
+        item.appendChild(document.createElement('br'));
+        item.appendChild(document.createTextNode(`icon${size}.png`));
+        previewEl.appendChild(item);
+
+        // 下载
+        const a = document.createElement('a');
+        a.href = dataUrl;
+        a.download = `icon${size}.png`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      });
+
+      alert('✅ 3个图标已下载！\n请将它们放入 icons/ 文件夹中。');
+    }
+  </script>
+</body>
+</html>
