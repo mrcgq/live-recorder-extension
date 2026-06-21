@@ -2,86 +2,614 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <title>直播内录器 Pro</title>
+  <title>直播内录器</title>
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { width: 420px; font-family: 'Microsoft YaHei', Arial, sans-serif; background: #0d0d0d; color: #fff; overflow-x: hidden; }
-    .header { background: linear-gradient(135deg, #1a1a1a, #2d2d2d); padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; border-bottom: 2px solid #e53935; }
-    .header-left { display: flex; align-items: center; gap: 8px; }
-    .logo { width: 28px; height: 28px; background: linear-gradient(135deg, #e53935, #ff6f00); border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 16px; }
-    .header-title { font-size: 15px; font-weight: bold; color: #fff; }
-    .header-subtitle { font-size: 11px; color: #888; }
-    .header-right { display: flex; gap: 6px; }
-    .header-btn { background: transparent; border: none; color: #888; cursor: pointer; font-size: 14px; padding: 4px 6px; border-radius: 4px; transition: all 0.2s; }
-    .header-btn:hover { background: #333; color: #fff; }
-    .monitor-bar { background: #111; padding: 6px 14px; display: flex; align-items: center; gap: 14px; font-size: 11px; border-bottom: 1px solid #222; }
-    .monitor-item { display: flex; align-items: center; gap: 4px; color: #888; }
-    .monitor-value { color: #4caf50; font-family: 'Courier New', monospace; font-weight: bold; }
-    .monitor-value.recording { color: #ff4444; }
-    .record-time-display { margin-left: auto; font-family: 'Courier New', monospace; font-size: 16px; font-weight: bold; color: #ff4444; letter-spacing: 2px; }
-    .record-time-display.idle { color: #555; }
-    .quality-bar { background: #1a1a1a; padding: 8px 14px; display: flex; align-items: center; gap: 6px; border-bottom: 1px solid #222; }
-    .quality-btn { background: #2d2d2d; border: 1px solid #444; color: #ccc; padding: 5px 14px; border-radius: 4px; font-size: 12px; cursor: pointer; transition: all 0.2s; font-weight: bold; }
-    .quality-btn:hover { border-color: #e53935; color: #fff; }
-    .quality-btn.active { background: linear-gradient(135deg, #1565c0, #0d47a1); border-color: #2196f3; color: #fff; box-shadow: 0 0 8px rgba(33, 150, 243, 0.4); }
-    .quality-btn.uhd.active { background: linear-gradient(135deg, #6a1b9a, #4a148c); border-color: #9c27b0; box-shadow: 0 0 8px rgba(156, 39, 176, 0.4); }
-    .region-btn { margin-left: auto; background: #2d2d2d; border: 1px solid #444; color: #ccc; padding: 5px 12px; border-radius: 4px; font-size: 12px; cursor: pointer; transition: all 0.2s; }
-    .region-btn:hover, .region-btn.active { border-color: #ff9800; color: #ff9800; background: #ff980011; }
-    .main-control { background: #111; padding: 14px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #222; }
-    .record-big-btn { width: 52px; height: 52px; border-radius: 50%; border: 3px solid #e53935; background: transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.3s; position: relative; flex-shrink: 0; }
-    .record-big-btn:hover { box-shadow: 0 0 20px rgba(229, 57, 53, 0.6); }
-    .record-big-btn .inner-dot { width: 26px; height: 26px; border-radius: 50%; background: #e53935; transition: all 0.3s; }
-    .record-big-btn.recording .inner-dot { border-radius: 4px; width: 20px; height: 20px; animation: pulse-record 1.5s infinite; }
-    @keyframes pulse-record { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(0.85); opacity: 0.7; } }
-    .record-big-btn.paused .inner-dot { background: #ff9800; border-radius: 3px; width: 8px; height: 22px; box-shadow: 10px 0 0 #ff9800; }
-    .control-right { flex: 1; }
-    .control-btns { display: flex; gap: 8px; margin-bottom: 8px; }
-    .ctrl-btn { flex: 1; background: #2d2d2d; border: 1px solid #444; color: #ccc; padding: 7px 0; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 4px; }
-    .ctrl-btn:hover:not(:disabled) { border-color: #666; background: #3d3d3d; }
-    .ctrl-btn:disabled { opacity: 0.35; cursor: not-allowed; }
-    .ctrl-btn.danger:hover:not(:disabled) { border-color: #e53935; color: #e53935; }
-    .ctrl-btn.warning:hover:not(:disabled) { border-color: #ff9800; color: #ff9800; }
-    .realtime-info { display: flex; gap: 10px; }
-    .info-chip { background: #1a1a1a; border: 1px solid #2d2d2d; border-radius: 4px; padding: 3px 8px; font-size: 10px; color: #888; font-family: 'Courier New', monospace; }
-    .info-chip span { color: #4caf50; }
-    .tabs { display: flex; background: #1a1a1a; border-bottom: 1px solid #222; }
-    .tab { flex: 1; padding: 8px; text-align: center; font-size: 12px; color: #888; cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s; }
-    .tab:hover { color: #ccc; background: #222; }
-    .tab.active { color: #fff; border-bottom-color: #e53935; background: #222; }
-    .panel { display: none; padding: 12px 14px; max-height: 320px; overflow-y: auto; }
-    .panel.active { display: block; }
-    .panel::-webkit-scrollbar { width: 4px; }
-    .panel::-webkit-scrollbar-track { background: #111; }
-    .panel::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
-    .option-group { background: #1a1a1a; border: 1px solid #2d2d2d; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
-    .option-group-title { font-size: 11px; color: #e53935; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }
-    .option-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #222; font-size: 12px; color: #ccc; }
-    .option-row:last-child { border-bottom: none; padding-bottom: 0; }
-    .option-row label { display: flex; align-items: center; gap: 6px; }
-    select { background: #2d2d2d; border: 1px solid #444; color: #fff; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; outline: none; }
-    select:focus { border-color: #e53935; }
-    input[type="text"] { background: #2d2d2d; border: 1px solid #444; color: #fff; padding: 4px 8px; border-radius: 4px; font-size: 11px; outline: none; width: 140px; }
-    input[type="text"]:focus { border-color: #e53935; }
-    .switch { position: relative; width: 36px; height: 18px; flex-shrink: 0; }
-    .switch input { opacity: 0; width: 0; height: 0; }
-    .switch-slider { position: absolute; cursor: pointer; inset: 0; background: #444; border-radius: 18px; transition: 0.3s; }
-    .switch-slider:before { position: absolute; content: ""; height: 12px; width: 12px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: 0.3s; }
-    input:checked + .switch-slider { background: #e53935; }
-    input:checked + .switch-slider:before { transform: translateX(18px); }
-    .rec-progress { background: #1a1a1a; border: 1px solid #2d2d2d; border-radius: 8px; padding: 12px; margin-bottom: 10px; display: none; }
-    .rec-progress.show { display: block; }
-    .progress-label { display: flex; justify-content: space-between; font-size: 11px; color: #888; margin-bottom: 6px; }
-    .progress-track { height: 4px; background: #2d2d2d; border-radius: 2px; overflow: hidden; }
-    .progress-fill { height: 100%; background: linear-gradient(90deg, #e53935, #ff6f00); border-radius: 2px; width: 0%; transition: width 0.5s; }
-    .shortcut-hint { font-size: 10px; color: #555; text-align: center; padding: 4px; }
-    kbd { background: #2d2d2d; border: 1px solid #444; border-radius: 3px; padding: 1px 4px; font-size: 10px; color: #888; }
-    .status-footer { background: #111; padding: 6px 14px; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid #222; }
-    .status-left { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #888; }
-    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #444; }
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 420px;
+      font-family: 'Microsoft YaHei', Arial, sans-serif;
+      background: #0d0d0d;
+      color: #fff;
+      overflow-x: hidden;
+    }
+
+    /* ===== 顶部标题栏 ===== */
+    .header {
+      background: linear-gradient(135deg, #1a1a1a, #2d2d2d);
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 2px solid #e53935;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .logo {
+      width: 28px;
+      height: 28px;
+      background: linear-gradient(135deg, #e53935, #ff6f00);
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+    }
+
+    .header-title {
+      font-size: 15px;
+      font-weight: bold;
+      color: #fff;
+    }
+
+    .header-subtitle {
+      font-size: 11px;
+      color: #888;
+    }
+
+    .header-right {
+      display: flex;
+      gap: 6px;
+    }
+
+    .header-btn {
+      background: transparent;
+      border: none;
+      color: #888;
+      cursor: pointer;
+      font-size: 14px;
+      padding: 4px 6px;
+      border-radius: 4px;
+      transition: all 0.2s;
+    }
+
+    .header-btn:hover {
+      background: #333;
+      color: #fff;
+    }
+
+    /* ===== 状态监控栏 ===== */
+    .monitor-bar {
+      background: #111;
+      padding: 6px 14px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-size: 11px;
+      border-bottom: 1px solid #222;
+    }
+
+    .monitor-item {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      color: #888;
+    }
+
+    .monitor-value {
+      color: #4caf50;
+      font-family: 'Courier New', monospace;
+      font-weight: bold;
+    }
+
+    .monitor-value.recording {
+      color: #ff4444;
+    }
+
+    .record-time-display {
+      margin-left: auto;
+      font-family: 'Courier New', monospace;
+      font-size: 16px;
+      font-weight: bold;
+      color: #ff4444;
+      letter-spacing: 2px;
+    }
+
+    .record-time-display.idle {
+      color: #555;
+    }
+
+    /* ===== 录制质量选择 ===== */
+    .quality-bar {
+      background: #1a1a1a;
+      padding: 8px 14px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      border-bottom: 1px solid #222;
+    }
+
+    .quality-btn {
+      background: #2d2d2d;
+      border: 1px solid #444;
+      color: #ccc;
+      padding: 5px 14px;
+      border-radius: 4px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+      font-weight: bold;
+    }
+
+    .quality-btn:hover {
+      border-color: #e53935;
+      color: #fff;
+    }
+
+    .quality-btn.active {
+      background: linear-gradient(135deg, #1565c0, #0d47a1);
+      border-color: #2196f3;
+      color: #fff;
+      box-shadow: 0 0 8px rgba(33, 150, 243, 0.4);
+    }
+
+    .quality-btn.uhd.active {
+      background: linear-gradient(135deg, #6a1b9a, #4a148c);
+      border-color: #9c27b0;
+      box-shadow: 0 0 8px rgba(156, 39, 176, 0.4);
+    }
+
+    .region-btn {
+      margin-left: auto;
+      background: #2d2d2d;
+      border: 1px solid #444;
+      color: #ccc;
+      padding: 5px 12px;
+      border-radius: 4px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .region-btn:hover, .region-btn.active {
+      border-color: #ff9800;
+      color: #ff9800;
+      background: #ff980011;
+    }
+
+    /* ===== 主录制控制区 ===== */
+    .main-control {
+      background: #111;
+      padding: 14px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      border-bottom: 1px solid #222;
+    }
+
+    .record-big-btn {
+      width: 52px;
+      height: 52px;
+      border-radius: 50%;
+      border: 3px solid #e53935;
+      background: transparent;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.3s;
+      position: relative;
+      flex-shrink: 0;
+    }
+
+    .record-big-btn:hover {
+      box-shadow: 0 0 20px rgba(229, 57, 53, 0.6);
+    }
+
+    .record-big-btn .inner-dot {
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background: #e53935;
+      transition: all 0.3s;
+    }
+
+    .record-big-btn.recording .inner-dot {
+      border-radius: 4px;
+      width: 20px;
+      height: 20px;
+      animation: pulse-record 1.5s infinite;
+    }
+
+    @keyframes pulse-record {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(0.85); opacity: 0.7; }
+    }
+
+    .record-big-btn.paused .inner-dot {
+      background: #ff9800;
+      border-radius: 3px;
+      width: 8px;
+      height: 22px;
+      box-shadow: 10px 0 0 #ff9800;
+    }
+
+    .control-right {
+      flex: 1;
+    }
+
+    .control-btns {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .ctrl-btn {
+      flex: 1;
+      background: #2d2d2d;
+      border: 1px solid #444;
+      color: #ccc;
+      padding: 7px 0;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+    }
+
+    .ctrl-btn:hover:not(:disabled) {
+      border-color: #666;
+      background: #3d3d3d;
+    }
+
+    .ctrl-btn:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+
+    .ctrl-btn.danger:hover:not(:disabled) {
+      border-color: #e53935;
+      color: #e53935;
+    }
+
+    .ctrl-btn.warning:hover:not(:disabled) {
+      border-color: #ff9800;
+      color: #ff9800;
+    }
+
+    /* 实时信息 */
+    .realtime-info {
+      display: flex;
+      gap: 10px;
+    }
+
+    .info-chip {
+      background: #1a1a1a;
+      border: 1px solid #2d2d2d;
+      border-radius: 4px;
+      padding: 3px 8px;
+      font-size: 10px;
+      color: #888;
+      font-family: 'Courier New', monospace;
+    }
+
+    .info-chip span {
+      color: #4caf50;
+    }
+
+    .info-chip span.warn {
+      color: #ff9800;
+    }
+
+    /* ===== 选项卡 ===== */
+    .tabs {
+      display: flex;
+      background: #1a1a1a;
+      border-bottom: 1px solid #222;
+    }
+
+    .tab {
+      flex: 1;
+      padding: 8px;
+      text-align: center;
+      font-size: 12px;
+      color: #888;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s;
+    }
+
+    .tab:hover {
+      color: #ccc;
+      background: #222;
+    }
+
+    .tab.active {
+      color: #fff;
+      border-bottom-color: #e53935;
+      background: #222;
+    }
+
+    /* ===== 面板内容 ===== */
+    .panel {
+      display: none;
+      padding: 12px 14px;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+
+    .panel.active {
+      display: block;
+    }
+
+    .panel::-webkit-scrollbar {
+      width: 4px;
+    }
+
+    .panel::-webkit-scrollbar-track {
+      background: #111;
+    }
+
+    .panel::-webkit-scrollbar-thumb {
+      background: #444;
+      border-radius: 2px;
+    }
+
+    /* 选项区域 */
+    .option-group {
+      background: #1a1a1a;
+      border: 1px solid #2d2d2d;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 10px;
+    }
+
+    .option-group-title {
+      font-size: 11px;
+      color: #e53935;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .option-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 0;
+      border-bottom: 1px solid #222;
+      font-size: 12px;
+      color: #ccc;
+    }
+
+    .option-row:last-child {
+      border-bottom: none;
+      padding-bottom: 0;
+    }
+
+    .option-row label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    select {
+      background: #2d2d2d;
+      border: 1px solid #444;
+      color: #fff;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+      outline: none;
+    }
+
+    select:focus {
+      border-color: #e53935;
+    }
+
+    input[type="text"] {
+      background: #2d2d2d;
+      border: 1px solid #444;
+      color: #fff;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      outline: none;
+      width: 140px;
+    }
+
+    input[type="text"]:focus {
+      border-color: #e53935;
+    }
+
+    /* 开关 */
+    .switch {
+      position: relative;
+      width: 36px;
+      height: 18px;
+      flex-shrink: 0;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .switch-slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background: #444;
+      border-radius: 18px;
+      transition: 0.3s;
+    }
+
+    .switch-slider:before {
+      position: absolute;
+      content: "";
+      height: 12px;
+      width: 12px;
+      left: 3px;
+      bottom: 3px;
+      background: white;
+      border-radius: 50%;
+      transition: 0.3s;
+    }
+
+    input:checked + .switch-slider {
+      background: #e53935;
+    }
+
+    input:checked + .switch-slider:before {
+      transform: translateX(18px);
+    }
+
+    /* ===== 录制列表 ===== */
+    .recordings-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .rec-item {
+      background: #1a1a1a;
+      border: 1px solid #2d2d2d;
+      border-radius: 8px;
+      padding: 10px 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      transition: border-color 0.2s;
+    }
+
+    .rec-item:hover {
+      border-color: #444;
+    }
+
+    .rec-thumb {
+      width: 60px;
+      height: 40px;
+      background: #2d2d2d;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+
+    .rec-thumb video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .rec-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .rec-name {
+      font-size: 12px;
+      color: #fff;
+      font-weight: bold;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 3px;
+    }
+
+    .rec-meta {
+      font-size: 11px;
+      color: #666;
+      display: flex;
+      gap: 8px;
+    }
+
+    .rec-badge {
+      background: #2d2d2d;
+      border-radius: 3px;
+      padding: 1px 5px;
+      font-size: 10px;
+    }
+
+    .rec-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .rec-btn {
+      background: #2d2d2d;
+      border: 1px solid #444;
+      color: #ccc;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.2s;
+    }
+
+    .rec-btn:hover {
+      border-color: #e53935;
+      color: #e53935;
+    }
+
+    .rec-btn.download:hover {
+      border-color: #4caf50;
+      color: #4caf50;
+    }
+
+    .empty-list {
+      text-align: center;
+      color: #555;
+      padding: 30px 20px;
+      font-size: 13px;
+      line-height: 2;
+    }
+
+    /* ===== 底部状态栏 ===== */
+    .status-footer {
+      background: #111;
+      padding: 6px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-top: 1px solid #222;
+    }
+
+    .status-left {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: #888;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #444;
+    }
+
     .status-dot.ready { background: #4caf50; }
-    .status-dot.recording { background: #e53935; animation: blink 1s infinite; }
+    .status-dot.recording { 
+      background: #e53935; 
+      animation: blink 1s infinite;
+    }
     .status-dot.paused { background: #ff9800; }
     .status-dot.error { background: #f44336; }
+
     @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
     .status-right { display: flex; gap: 10px; }
     .foot-btn { background: transparent; border: none; color: #666; cursor: pointer; font-size: 11px; transition: color 0.2s; display: flex; align-items: center; gap: 3px; }
