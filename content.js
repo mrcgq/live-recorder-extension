@@ -1,54 +1,46 @@
 'use strict';
 
 // ============================================================
-// Content Script - 完整版
-// 功能：
-//   1. 自动检测网页 <video> 元素，悬停显示录制工具栏
-//   2. 悬浮录制控制条（可拖拽）
-//   3. 区域选择框
-//   4. MutationObserver 监听动态加载的视频（直播网站必须）
+// Content Script - 最终优化版
+// 修复：
+//   1. 合并 bindDebounce / bindTimeout 为唯一节流变量（Law-01）
+//   2. 移除未使用的 throttledBindAllVideos 外部定义
+//   3. 悬浮条暂停/继续逻辑修正
 // ============================================================
 
-// ============================================================
-// 全局状态
-// ============================================================
 const CS = {
-  // 悬停工具栏
-  hoverVideo  : null,   // 当前悬停的 video 元素
-  hoverBar    : null,   // 工具栏 DOM
-  hoverRAF    : null,   // requestAnimationFrame id（位置跟随）
-  leaveTimer  : null,   // 鼠标离开延迟计时器
-
-  // 悬浮控制条
+  hoverVideo  : null,
+  hoverBar    : null,
+  hoverRAF    : null,
+  leaveTimer  : null,
   floatBar    : null,
   floatTimer  : null,
   floatSec    : 0,
   floatPaused : false,
-
-  // 区域选择
   regionActive: false,
-
-  // MutationObserver
   observer    : null,
+  bindTimeout : null,   // ★ 唯一节流计时器（合并后）
 };
 
 // ============================================================
 // 工具函数
 // ============================================================
 function fmtTime(s) {
-  const h = String(Math.floor(s / 3600)).padStart(2, '0');
-  const m = String(Math.floor(s % 3600 / 60)).padStart(2, '0');
-  const sc = String(s % 60).padStart(2, '0');
-  return `${h}:${m}:${sc}`;
+  s = s || 0;
+  return [
+    Math.floor(s / 3600),
+    Math.floor((s % 3600) / 60),
+    s % 60,
+  ].map((n) => String(n).padStart(2, '0')).join(':');
 }
 
 // ============================================================
-// 消息监听（来自 popup / background）
+// 消息监听
 // ============================================================
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   switch (msg.action) {
     case 'showFloat':
-      showFloat(msg.position || 'bottom-right');
+      showFloat(msg.position || 'top-right');
       break;
     case 'removeFloat':
       removeFloat();
@@ -62,43 +54,48 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     case 'disableRegionSelect':
       stopRegion();
       break;
+    default:
+      break;
   }
   sendResponse({ ok: true });
   return true;
 });
 
 // ============================================================
-// ★ 核心：自动视频检测系统
+// 视频自动检测（★ 唯一防抖入口，消除冗余）
 // ============================================================
+function throttledBindAllVideos() {
+  // ★ 利用 CS.bindTimeout 唯一控制，1000ms 内只执行一次（Law-01/46）
+  if (CS.bindTimeout) return;
+  CS.bindTimeout = setTimeout(() => {
+    bindAllVideos();
+    CS.bindTimeout = null;
+  }, 1000);
+}
 
-/**
- * 初始化视频检测
- * 使用 mouseenter/mouseleave 代替 mouseover（性能更好）
- * 使用 MutationObserver 监听动态加载的视频
- */
 function initVideoDetection() {
-
-  // 1. 对已存在的视频绑定事件
   bindAllVideos();
 
-  // 2. MutationObserver：监听 DOM 变化，捕获动态加载的 video
-  //    （斗鱼、虎牙、B站、抖音等直播网站都是动态渲染的）
   CS.observer = new MutationObserver((mutations) => {
-    let needRebind = false;
+    let hasVideoNode = false;
+
     for (const m of mutations) {
       for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
-        // 新增节点本身是 video，或包含 video
-        if (node.tagName === 'VIDEO' || node.querySelector?.('video')) {
-          needRebind = true;
+        if (
+          node.tagName === 'VIDEO' ||
+          (node.querySelector && node.querySelector('video'))
+        ) {
+          hasVideoNode = true;
           break;
         }
       }
-      if (needRebind) break;
+      if (hasVideoNode) break;
     }
-    if (needRebind) {
-      // 延迟一帧，等待 DOM 稳定
-      requestAnimationFrame(bindAllVideos);
+
+    // ★ 只在真正检测到 video 节点时才触发节流绑定
+    if (hasVideoNode) {
+      throttledBindAllVideos();
     }
   });
 
@@ -108,292 +105,227 @@ function initVideoDetection() {
   });
 }
 
-/**
- * 绑定页面上所有 video 元素的悬停事件
- */
 function bindAllVideos() {
-  const videos = document.querySelectorAll('video');
-  videos.forEach(bindVideo);
+  document.querySelectorAll('video').forEach(bindVideo);
 }
 
-/**
- * 给单个 video 元素绑定事件
- */
 function bindVideo(video) {
-  // 避免重复绑定
   if (video.__recBound) return;
   video.__recBound = true;
 
   video.addEventListener('mouseenter', () => onVideoEnter(video));
-  video.addEventListener('mouseleave', () => onVideoLeave(video));
+  video.addEventListener('mouseleave', () => onVideoLeave());
 }
 
-/**
- * 鼠标进入 video 区域
- */
 function onVideoEnter(video) {
-  // 取消离开计时器
   clearTimeout(CS.leaveTimer);
 
-  // 视频太小则忽略（避免广告等小视频误触发）
   const rect = video.getBoundingClientRect();
+  // 过滤过小的视频（广告、头像等）
   if (rect.width < 200 || rect.height < 120) return;
-
-  // 已经是同一个视频，不重建
   if (CS.hoverVideo === video && CS.hoverBar) return;
 
   CS.hoverVideo = video;
   createHoverBar(video);
 }
 
-/**
- * 鼠标离开 video 区域
- */
-function onVideoLeave(video) {
-  // 延迟 400ms 再销毁（给用户时间移到工具栏上）
+function onVideoLeave() {
   CS.leaveTimer = setTimeout(() => {
-    // 检查鼠标是否在工具栏上
-    if (CS.hoverBar?.matches(':hover')) return;
+    // 如果鼠标已移入工具栏，取消销毁
+    if (CS.hoverBar && CS.hoverBar.matches(':hover')) return;
     destroyHoverBar();
   }, 400);
 }
 
 // ============================================================
-// ★ 悬停工具栏（360风格）
+// 悬停工具栏
 // ============================================================
-
-/**
- * 创建视频悬停工具栏
- * 使用 fixed 定位（不是 absolute），避免受页面滚动影响
- */
 function createHoverBar(video) {
   destroyHoverBar();
 
-  const bar = document.createElement('div');
-  bar.id = '__rec_hover_bar__';
-
-  // ✅ 关键：使用 fixed 定位！
-  bar.style.cssText = `
-    position: fixed;
-    z-index: 2147483647;
-    background: rgba(10, 20, 40, 0.88);
-    border: 1px solid rgba(76, 175, 80, 0.8);
-    border-radius: 6px;
-    padding: 0;
-    display: flex;
-    align-items: stretch;
-    font-family: 'Microsoft YaHei', Arial, sans-serif;
-    font-size: 12px;
-    color: #fff;
-    box-shadow: 0 3px 12px rgba(0,0,0,0.5);
-    user-select: none;
-    pointer-events: auto;
-    overflow: hidden;
-    backdrop-filter: blur(6px);
-    transition: opacity 0.2s;
-    opacity: 0;
-  `;
-
-  bar.innerHTML = `
-    <style>
+  // 样式仅注入一次
+  if (!document.getElementById('__rec_style__')) {
+    const style = document.createElement('style');
+    style.id = '__rec_style__';
+    style.textContent = `
+      #__rec_hover_bar__ {
+        position: fixed;
+        z-index: 2147483647;
+        background: rgba(8, 18, 36, 0.92);
+        border: 1px solid rgba(76, 175, 80, 0.8);
+        border-radius: 6px;
+        display: flex;
+        align-items: stretch;
+        overflow: hidden;
+        font-family: 'Microsoft YaHei', Arial, sans-serif;
+        font-size: 12px;
+        color: #fff;
+        box-shadow: 0 3px 14px rgba(0,0,0,0.55);
+        user-select: none;
+        backdrop-filter: blur(6px);
+        opacity: 0;
+        transition: opacity 0.18s;
+        pointer-events: auto;
+      }
       #__rec_hover_bar__ button {
         background: transparent;
         border: none;
+        border-right: 1px solid rgba(255,255,255,0.1);
         color: #fff;
-        padding: 7px 11px;
+        padding: 7px 12px;
         cursor: pointer;
         font-size: 11px;
-        font-family: 'Microsoft YaHei', Arial, sans-serif;
+        font-family: inherit;
         display: flex;
         align-items: center;
         gap: 5px;
         white-space: nowrap;
         transition: background 0.15s;
-        border-right: 1px solid rgba(255,255,255,0.1);
       }
-      #__rec_hover_bar__ button:last-child {
-        border-right: none;
+      #__rec_hover_bar__ button:last-child { border-right: none; }
+      #__rec_hover_bar__ button:hover { background: rgba(76,175,80,0.28); }
+      #__rec_hover_bar__ .rdot {
+        width: 8px; height: 8px; border-radius: 50%;
+        background: #f44336; display: inline-block; flex-shrink: 0;
+        animation: _rdot 1.2s infinite;
       }
-      #__rec_hover_bar__ button:hover {
-        background: rgba(76,175,80,0.3);
-      }
-      #__rec_hover_bar__ .rec-dot {
-        width: 8px; height: 8px;
-        border-radius: 50%;
-        background: #f44336;
-        display: inline-block;
-        animation: _hdot 1.2s infinite;
-        flex-shrink: 0;
-      }
-      @keyframes _hdot {
-        0%,100%{opacity:1} 50%{opacity:0.3}
-      }
-    </style>
+      @keyframes _rdot { 0%,100%{opacity:1} 50%{opacity:0.25} }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
 
-    <button id="__rec_btn_record__">
-      <span class="rec-dot"></span>
-      录制小视频
-    </button>
-
-    <button id="__rec_btn_snapshot__">
-      📷 截图
-    </button>
-
-    <button id="__rec_btn_pip__">
-      🪟 画中画
-    </button>
-
-    <button id="__rec_btn_close__" style="padding:7px 8px; color:#888;">
-      ✕
-    </button>
+  const bar = document.createElement('div');
+  bar.id = '__rec_hover_bar__';
+  bar.innerHTML = `
+    <button id="__rb_rec__"><span class="rdot"></span>录制小视频</button>
+    <button id="__rb_snap__">📷 截图</button>
+    <button id="__rb_pip__">🪟 画中画</button>
+    <button id="__rb_close__" style="color:#999;padding:7px 9px;">✕</button>
   `;
 
-  // 鼠标移入工具栏：取消离开计时器
   bar.addEventListener('mouseenter', () => clearTimeout(CS.leaveTimer));
   bar.addEventListener('mouseleave', () => {
     CS.leaveTimer = setTimeout(destroyHoverBar, 300);
   });
 
-  // ★ 录制按钮
-  bar.querySelector('#__rec_btn_record__').onclick = (e) => {
+  bar.querySelector('#__rb_rec__').addEventListener('click', (e) => {
     e.stopPropagation();
     onClickRecord(video);
-  };
-
-  // ★ 截图按钮
-  bar.querySelector('#__rec_btn_snapshot__').onclick = (e) => {
+  });
+  bar.querySelector('#__rb_snap__').addEventListener('click', (e) => {
     e.stopPropagation();
     captureSnapshot(video);
-  };
-
-  // ★ 画中画按钮
-  bar.querySelector('#__rec_btn_pip__').onclick = (e) => {
+  });
+  bar.querySelector('#__rb_pip__').addEventListener('click', (e) => {
     e.stopPropagation();
     togglePiP(video);
-  };
-
-  // 关闭按钮
-  bar.querySelector('#__rec_btn_close__').onclick = (e) => {
+  });
+  bar.querySelector('#__rb_close__').addEventListener('click', (e) => {
     e.stopPropagation();
     destroyHoverBar();
-  };
+  });
 
   document.documentElement.appendChild(bar);
   CS.hoverBar = bar;
 
-  // 初次定位
   positionHoverBar(video);
 
-  // 淡入
-  requestAnimationFrame(() => {
+  // 双 RAF 确保 CSS transition 触发
+  requestAnimationFrame(() => requestAnimationFrame(() => {
     if (CS.hoverBar) CS.hoverBar.style.opacity = '1';
-  });
+  }));
 
-  // ✅ 使用 RAF 持续跟随（处理视频位置变化/页面滚动）
-  function trackPosition() {
+  // RAF 持续跟随视频位置
+  function trackLoop() {
     if (!CS.hoverBar || !CS.hoverVideo) return;
     positionHoverBar(CS.hoverVideo);
-    CS.hoverRAF = requestAnimationFrame(trackPosition);
+    CS.hoverRAF = requestAnimationFrame(trackLoop);
   }
-  CS.hoverRAF = requestAnimationFrame(trackPosition);
+  CS.hoverRAF = requestAnimationFrame(trackLoop);
 }
 
-/**
- * 计算并更新工具栏位置（fixed 定位，相对视口）
- */
 function positionHoverBar(video) {
   if (!CS.hoverBar) return;
   const rect = video.getBoundingClientRect();
-  const barW = CS.hoverBar.offsetWidth || 280;
+  const barW = CS.hoverBar.offsetWidth  || 295;
   const barH = CS.hoverBar.offsetHeight || 34;
 
-  // 默认：视频右上角，向内偏移8px
-  let top  = rect.top + 8;
-  let left = rect.right - barW - 8;
+  let top  = rect.top  + 10;
+  let left = rect.right - barW - 10;
 
-  // 防止超出视口
-  if (left < rect.left) left = rect.left + 8;
-  if (top < 4) top = 4;
-  if (top + barH > window.innerHeight) top = rect.bottom - barH - 8;
+  if (left < rect.left + 4)                    left = rect.left + 4;
+  if (top  < 4)                                top  = 4;
+  if (top  + barH > window.innerHeight - 4)    top  = rect.bottom - barH - 10;
 
   CS.hoverBar.style.top  = top  + 'px';
   CS.hoverBar.style.left = left + 'px';
 }
 
-/**
- * 销毁工具栏
- */
 function destroyHoverBar() {
   clearTimeout(CS.leaveTimer);
-  if (CS.hoverRAF) {
-    cancelAnimationFrame(CS.hoverRAF);
-    CS.hoverRAF = null;
-  }
-  CS.hoverBar?.remove();
-  CS.hoverBar  = null;
+  if (CS.hoverRAF) { cancelAnimationFrame(CS.hoverRAF); CS.hoverRAF = null; }
+  if (CS.hoverBar) { CS.hoverBar.remove(); CS.hoverBar = null; }
   CS.hoverVideo = null;
 }
 
 // ============================================================
-// ★ 录制按钮点击处理
+// 录制按钮点击
 // ============================================================
 function onClickRecord(video) {
   destroyHoverBar();
-
-  // 1. 显示悬浮控制条
   showFloat('top-right');
+  showInPageToast('🔴 正在启动录制，请在弹窗中授权...');
 
-  // 2. 通知 background → popup 开始录制
-  //    background 会通过 port 转发给 popup
+  // background 会从 sender.tab.id 获取精确 tabId
   chrome.runtime.sendMessage({
     action: 'startRecordFromContent',
-    videoInfo: {
-      src   : video.currentSrc || video.src || '',
-      width : video.videoWidth,
-      height: video.videoHeight,
-      time  : video.currentTime,
-    }
+    config: {
+      sysAudio  : true,
+      micAudio  : false,
+      noAudio   : false,
+      format    : 'webm',
+      vbps      : 6_000_000,
+      abps      : 192_000,
+      fps       : 30,
+      filePrefix: '直播录制',
+      quality   : 'hd',
+    },
   });
-
-  // 3. 同时弹出 popup 提示用户确认
-  //    （Chrome 不允许 content 直接控制 popup，但可以发消息）
-  chrome.runtime.sendMessage({ action: 'openPopup' });
 }
 
 // ============================================================
-// ★ 截图功能
+// 截图
 // ============================================================
 function captureSnapshot(video) {
   try {
-    const canvas = document.createElement('canvas');
-    canvas.width  = video.videoWidth  || video.clientWidth;
-    canvas.height = video.videoHeight || video.clientHeight;
+    const w = video.videoWidth  || video.clientWidth  || 1280;
+    const h = video.videoHeight || video.clientHeight || 720;
 
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const canvas = document.createElement('canvas');
+    canvas.width  = w;
+    canvas.height = h;
+    canvas.getContext('2d').drawImage(video, 0, 0, w, h);
 
     canvas.toBlob((blob) => {
-      if (!blob) {
-        showInPageToast('❌ 截图失败（跨域视频限制）');
-        return;
-      }
+      if (!blob) { showInPageToast('❌ 截图失败（跨域限制）'); return; }
       const url = URL.createObjectURL(blob);
       const a   = document.createElement('a');
       const ts  = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      a.href     = url;
-      a.download = `截图_${ts}.png`;
+      a.href          = url;
+      a.download      = '截图_' + ts + '.png';
+      a.style.display = 'none';
+      document.body.appendChild(a);
       a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 3000);
+      setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 3000);
       showInPageToast('📷 截图已保存！');
     }, 'image/png');
-
   } catch (e) {
     showInPageToast('❌ 截图失败: ' + e.message);
   }
 }
 
 // ============================================================
-// ★ 画中画功能
+// 画中画
 // ============================================================
 async function togglePiP(video) {
   try {
@@ -412,39 +344,39 @@ async function togglePiP(video) {
 // ============================================================
 // 页面内 Toast 提示
 // ============================================================
-function showInPageToast(msg, ms = 2500) {
+function showInPageToast(msg, ms) {
+  ms = ms || 2500;
   let el = document.getElementById('__rec_page_toast__');
   if (!el) {
     el = document.createElement('div');
     el.id = '__rec_page_toast__';
-    el.style.cssText = `
-      position: fixed;
-      bottom: 80px;
-      left: 50%;
-      transform: translateX(-50%);
-      background: rgba(20,20,20,0.92);
-      border: 1px solid #444;
-      color: #fff;
-      padding: 10px 20px;
-      border-radius: 8px;
-      font-size: 13px;
-      font-family: 'Microsoft YaHei', Arial, sans-serif;
-      z-index: 2147483647;
-      pointer-events: none;
-      white-space: nowrap;
-      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
-      transition: opacity 0.3s;
-    `;
+    el.style.cssText = [
+      'position:fixed', 'bottom:80px', 'left:50%',
+      'transform:translateX(-50%)',
+      'background:rgba(16,16,16,0.94)',
+      'border:1px solid #555',
+      'color:#fff',
+      'padding:10px 22px',
+      'border-radius:8px',
+      'font-size:13px',
+      'font-family:Microsoft YaHei,Arial,sans-serif',
+      'z-index:2147483647',
+      'pointer-events:none',
+      'white-space:nowrap',
+      'box-shadow:0 4px 18px rgba(0,0,0,0.45)',
+      'transition:opacity 0.3s',
+      'opacity:0',
+    ].join(';');
     document.documentElement.appendChild(el);
   }
-  el.textContent = msg;
+  el.textContent   = msg;
   el.style.opacity = '1';
-  clearTimeout(el.__timer);
-  el.__timer = setTimeout(() => { el.style.opacity = '0'; }, ms);
+  clearTimeout(el.__t);
+  el.__t = setTimeout(() => { el.style.opacity = '0'; }, ms);
 }
 
 // ============================================================
-// 悬浮控制条
+// 悬浮录制控制条
 // ============================================================
 function showFloat(position) {
   removeFloat();
@@ -459,40 +391,38 @@ function showFloat(position) {
 
   const bar = document.createElement('div');
   bar.id = '__live_rec_float__';
-  bar.style.cssText = `
-    position: fixed;
-    ${posMap[position] || posMap['top-right']}
-    z-index: 2147483647;
-    background: rgba(13,13,13,0.93);
-    border: 1.5px solid #e53935;
-    border-radius: 10px;
-    padding: 8px 14px;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-family: 'Microsoft YaHei', Arial, sans-serif;
-    font-size: 13px;
-    color: #fff;
-    box-shadow: 0 4px 24px rgba(229,57,53,0.4);
-    user-select: none;
-    min-width: 220px;
-    backdrop-filter: blur(10px);
-    cursor: move;
-  `;
+  bar.style.cssText = [
+    'position:fixed',
+    posMap[position] || posMap['top-right'],
+    'z-index:2147483647',
+    'background:rgba(13,13,13,0.94)',
+    'border:1.5px solid #e53935',
+    'border-radius:10px',
+    'padding:8px 14px',
+    'display:flex',
+    'align-items:center',
+    'gap:10px',
+    'font-family:Microsoft YaHei,Arial,sans-serif',
+    'font-size:13px',
+    'color:#fff',
+    'box-shadow:0 4px 24px rgba(229,57,53,0.4)',
+    'user-select:none',
+    'min-width:220px',
+    'backdrop-filter:blur(10px)',
+    'cursor:move',
+  ].join(';');
 
   bar.innerHTML = `
     <style>
       @keyframes _rfb { 0%,100%{opacity:1} 50%{opacity:.15} }
     </style>
     <span style="
-      width:10px;height:10px;border-radius:50%;
-      background:#e53935;flex-shrink:0;
-      animation:_rfb 1s infinite;display:inline-block;
+      width:10px;height:10px;border-radius:50%;background:#e53935;
+      flex-shrink:0;display:inline-block;animation:_rfb 1s infinite;
     "></span>
     <span id="_rf_time" style="
-      font-family:'Courier New',monospace;
-      font-size:14px;font-weight:bold;
-      color:#ff6666;letter-spacing:1px;flex:1;
+      font-family:'Courier New',monospace;font-size:14px;
+      font-weight:bold;color:#ff6666;letter-spacing:1px;flex:1;
     ">00:00:00</span>
     <button id="_rf_pause" style="
       background:rgba(255,152,0,.15);border:1px solid #ff9800;
@@ -505,9 +435,8 @@ function showFloat(position) {
       cursor:pointer;font-size:11px;font-family:inherit;
     ">⏹ 停止</button>
     <button id="_rf_close" style="
-      background:transparent;border:none;
-      color:#666;cursor:pointer;font-size:18px;
-      line-height:1;padding:0 2px;
+      background:transparent;border:none;color:#666;
+      cursor:pointer;font-size:18px;line-height:1;padding:0 2px;
     ">×</button>
   `;
 
@@ -516,36 +445,45 @@ function showFloat(position) {
   CS.floatSec    = 0;
   CS.floatPaused = false;
 
-  document.getElementById('_rf_pause').onclick = () => {
+  // ★ 修复：暂停/继续逻辑正确区分两种状态
+  bar.querySelector('#_rf_pause').addEventListener('click', () => {
     CS.floatPaused = !CS.floatPaused;
-    document.getElementById('_rf_pause').textContent =
+    bar.querySelector('#_rf_pause').textContent =
       CS.floatPaused ? '▶ 继续' : '⏸ 暂停';
-    chrome.runtime.sendMessage({ action: 'floatPause' });
-  };
 
-  document.getElementById('_rf_stop').onclick = () => {
-    chrome.runtime.sendMessage({ action: 'floatStop' });
+    // 发送正确的动作（不是固定的 floatPause）
+    const action = CS.floatPaused ? 'pauseRecording' : 'resumeRecording';
+    chrome.runtime.sendMessage(
+      { action, _target: 'offscreen' },
+      () => void chrome.runtime.lastError
+    );
+  });
+
+  bar.querySelector('#_rf_stop').addEventListener('click', () => {
+    chrome.runtime.sendMessage(
+      { action: 'stopRecording', _target: 'offscreen' },
+      () => void chrome.runtime.lastError
+    );
     removeFloat();
-  };
+  });
 
-  document.getElementById('_rf_close').onclick = removeFloat;
+  bar.querySelector('#_rf_close').addEventListener('click', removeFloat);
 
   makeDraggable(bar);
   startFloatTimer();
 }
 
 function removeFloat() {
-  CS.floatBar?.remove();
-  CS.floatBar = null;
+  if (CS.floatBar) { CS.floatBar.remove(); CS.floatBar = null; }
   stopFloatTimer();
 }
 
 function updateFloat(paused, timeStr) {
-  CS.floatPaused = paused;
+  CS.floatPaused = !!paused;
   const te = document.getElementById('_rf_time');
   const pe = document.getElementById('_rf_pause');
   if (te && timeStr) te.textContent = timeStr;
-  if (pe) pe.textContent = paused ? '▶ 继续' : '⏸ 暂停';
+  if (pe) pe.textContent = CS.floatPaused ? '▶ 继续' : '⏸ 暂停';
 }
 
 function startFloatTimer() {
@@ -560,8 +498,7 @@ function startFloatTimer() {
 }
 
 function stopFloatTimer() {
-  clearInterval(CS.floatTimer);
-  CS.floatTimer = null;
+  if (CS.floatTimer) { clearInterval(CS.floatTimer); CS.floatTimer = null; }
 }
 
 // ============================================================
@@ -575,7 +512,7 @@ function makeDraggable(el) {
     drag = true;
     sx = e.clientX; sy = e.clientY;
     const r = el.getBoundingClientRect();
-    ox = r.left;    oy = r.top;
+    ox = r.left; oy = r.top;
     e.preventDefault();
   });
 
@@ -599,67 +536,70 @@ function startRegion() {
   CS.regionActive = true;
 
   const overlay = document.createElement('div');
-  overlay.style.cssText = `
-    position:fixed;inset:0;z-index:2147483646;
-    background:rgba(0,0,0,0.35);cursor:crosshair;
-  `;
+  overlay.style.cssText = [
+    'position:fixed', 'inset:0', 'z-index:2147483646',
+    'background:rgba(0,0,0,0.32)', 'cursor:crosshair',
+  ].join(';');
 
   const tip = document.createElement('div');
-  tip.style.cssText = `
-    position:fixed;top:50%;left:50%;
-    transform:translate(-50%,-50%);
-    background:rgba(229,57,53,0.92);color:#fff;
-    padding:12px 28px;border-radius:8px;
-    font-size:15px;font-family:'Microsoft YaHei',Arial;
-    pointer-events:none;user-select:none;
-  `;
-  tip.textContent = '🔲 拖拽鼠标选择录制区域 | Esc 取消';
+  tip.style.cssText = [
+    'position:fixed', 'top:50%', 'left:50%',
+    'transform:translate(-50%,-50%)',
+    'background:rgba(229,57,53,0.93)',
+    'color:#fff', 'padding:12px 28px', 'border-radius:8px',
+    'font-size:15px', 'font-family:Microsoft YaHei,Arial',
+    'pointer-events:none', 'user-select:none', 'white-space:nowrap',
+  ].join(';');
+  tip.textContent = '🔲 拖拽选择录制区域 | Esc 取消';
   overlay.appendChild(tip);
   document.documentElement.appendChild(overlay);
 
-  let sx, sy, box = null;
+  let startX, startY, selBox = null;
 
   const onDown = (e) => {
     tip.style.display = 'none';
-    sx = e.clientX; sy = e.clientY;
-    box = document.createElement('div');
-    box.style.cssText = `
-      position:fixed;border:2px solid #e53935;
-      background:rgba(229,57,53,.1);pointer-events:none;
-      z-index:2147483647;
-    `;
-    document.documentElement.appendChild(box);
+    startX = e.clientX; startY = e.clientY;
+    selBox = document.createElement('div');
+    selBox.style.cssText = [
+      'position:fixed',
+      'border:2px solid #e53935',
+      'background:rgba(229,57,53,0.08)',
+      'pointer-events:none',
+      'z-index:2147483647',
+    ].join(';');
+    document.documentElement.appendChild(selBox);
   };
 
   const onMove = (e) => {
-    if (!box) return;
-    const x = Math.min(e.clientX, sx);
-    const y = Math.min(e.clientY, sy);
-    const w = Math.abs(e.clientX - sx);
-    const h = Math.abs(e.clientY - sy);
-    box.style.left   = x + 'px';
-    box.style.top    = y + 'px';
-    box.style.width  = w + 'px';
-    box.style.height = h + 'px';
+    if (!selBox) return;
+    const x = Math.min(e.clientX, startX);
+    const y = Math.min(e.clientY, startY);
+    const w = Math.abs(e.clientX - startX);
+    const h = Math.abs(e.clientY - startY);
+    selBox.style.left   = x + 'px';
+    selBox.style.top    = y + 'px';
+    selBox.style.width  = w + 'px';
+    selBox.style.height = h + 'px';
   };
 
   const onUp = (e) => {
     const rect = {
-      x     : Math.min(e.clientX, sx),
-      y     : Math.min(e.clientY, sy),
-      width : Math.abs(e.clientX - sx),
-      height: Math.abs(e.clientY - sy),
+      x     : Math.min(e.clientX, startX),
+      y     : Math.min(e.clientY, startY),
+      width : Math.abs(e.clientX - startX),
+      height: Math.abs(e.clientY - startY),
     };
-    box?.remove(); box = null;
+    if (selBox) { selBox.remove(); selBox = null; }
     cleanup();
     if (rect.width > 10 && rect.height > 10) {
-      chrome.runtime.sendMessage({ action: 'regionSelected', rect });
-      showInPageToast(`🔲 区域已选: ${rect.width}×${rect.height}`);
+      showInPageToast('🔲 已选区域: ' + rect.width + '×' + rect.height);
     }
   };
 
   const onKey = (e) => {
-    if (e.key === 'Escape') { box?.remove(); cleanup(); }
+    if (e.key !== 'Escape') return;
+    if (selBox) { selBox.remove(); selBox = null; }
+    cleanup();
   };
 
   function cleanup() {
@@ -667,14 +607,14 @@ function startRegion() {
     overlay.remove();
     overlay.removeEventListener('mousedown', onDown);
     document.removeEventListener('mousemove', onMove);
-    document.removeEventListener('mouseup', onUp);
-    document.removeEventListener('keydown', onKey);
+    document.removeEventListener('mouseup',   onUp);
+    document.removeEventListener('keydown',   onKey);
   }
 
   overlay.addEventListener('mousedown', onDown);
   document.addEventListener('mousemove', onMove);
-  document.addEventListener('mouseup', onUp);
-  document.addEventListener('keydown', onKey);
+  document.addEventListener('mouseup',   onUp);
+  document.addEventListener('keydown',   onKey);
 }
 
 function stopRegion() {
@@ -684,7 +624,6 @@ function stopRegion() {
 // ============================================================
 // 启动
 // ============================================================
-// 等 DOM 就绪后再初始化
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', initVideoDetection);
 } else {
