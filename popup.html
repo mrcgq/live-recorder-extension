@@ -2,730 +2,94 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <title>直播内录器</title>
+  <title>直播内录器 Pro</title>
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-
-    body {
-      width: 420px;
-      font-family: 'Microsoft YaHei', Arial, sans-serif;
-      background: #0d0d0d;
-      color: #fff;
-      overflow-x: hidden;
-    }
-
-    /* ===== 顶部标题栏 ===== */
-    .header {
-      background: linear-gradient(135deg, #1a1a1a, #2d2d2d);
-      padding: 10px 14px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-bottom: 2px solid #e53935;
-    }
-
-    .header-left {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .logo {
-      width: 28px;
-      height: 28px;
-      background: linear-gradient(135deg, #e53935, #ff6f00);
-      border-radius: 6px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 16px;
-    }
-
-    .header-title {
-      font-size: 15px;
-      font-weight: bold;
-      color: #fff;
-    }
-
-    .header-subtitle {
-      font-size: 11px;
-      color: #888;
-    }
-
-    .header-right {
-      display: flex;
-      gap: 6px;
-    }
-
-    .header-btn {
-      background: transparent;
-      border: none;
-      color: #888;
-      cursor: pointer;
-      font-size: 14px;
-      padding: 4px 6px;
-      border-radius: 4px;
-      transition: all 0.2s;
-    }
-
-    .header-btn:hover {
-      background: #333;
-      color: #fff;
-    }
-
-    /* ===== 状态监控栏 ===== */
-    .monitor-bar {
-      background: #111;
-      padding: 6px 14px;
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      font-size: 11px;
-      border-bottom: 1px solid #222;
-    }
-
-    .monitor-item {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      color: #888;
-    }
-
-    .monitor-value {
-      color: #4caf50;
-      font-family: 'Courier New', monospace;
-      font-weight: bold;
-    }
-
-    .monitor-value.recording {
-      color: #ff4444;
-    }
-
-    .record-time-display {
-      margin-left: auto;
-      font-family: 'Courier New', monospace;
-      font-size: 16px;
-      font-weight: bold;
-      color: #ff4444;
-      letter-spacing: 2px;
-    }
-
-    .record-time-display.idle {
-      color: #555;
-    }
-
-    /* ===== 录制质量选择 ===== */
-    .quality-bar {
-      background: #1a1a1a;
-      padding: 8px 14px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      border-bottom: 1px solid #222;
-    }
-
-    .quality-btn {
-      background: #2d2d2d;
-      border: 1px solid #444;
-      color: #ccc;
-      padding: 5px 14px;
-      border-radius: 4px;
-      font-size: 12px;
-      cursor: pointer;
-      transition: all 0.2s;
-      font-weight: bold;
-    }
-
-    .quality-btn:hover {
-      border-color: #e53935;
-      color: #fff;
-    }
-
-    .quality-btn.active {
-      background: linear-gradient(135deg, #1565c0, #0d47a1);
-      border-color: #2196f3;
-      color: #fff;
-      box-shadow: 0 0 8px rgba(33, 150, 243, 0.4);
-    }
-
-    .quality-btn.uhd.active {
-      background: linear-gradient(135deg, #6a1b9a, #4a148c);
-      border-color: #9c27b0;
-      box-shadow: 0 0 8px rgba(156, 39, 176, 0.4);
-    }
-
-    .region-btn {
-      margin-left: auto;
-      background: #2d2d2d;
-      border: 1px solid #444;
-      color: #ccc;
-      padding: 5px 12px;
-      border-radius: 4px;
-      font-size: 12px;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
-
-    .region-btn:hover, .region-btn.active {
-      border-color: #ff9800;
-      color: #ff9800;
-      background: #ff980011;
-    }
-
-    /* ===== 主录制控制区 ===== */
-    .main-control {
-      background: #111;
-      padding: 14px;
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      border-bottom: 1px solid #222;
-    }
-
-    .record-big-btn {
-      width: 52px;
-      height: 52px;
-      border-radius: 50%;
-      border: 3px solid #e53935;
-      background: transparent;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transition: all 0.3s;
-      position: relative;
-      flex-shrink: 0;
-    }
-
-    .record-big-btn:hover {
-      box-shadow: 0 0 20px rgba(229, 57, 53, 0.6);
-    }
-
-    .record-big-btn .inner-dot {
-      width: 26px;
-      height: 26px;
-      border-radius: 50%;
-      background: #e53935;
-      transition: all 0.3s;
-    }
-
-    .record-big-btn.recording .inner-dot {
-      border-radius: 4px;
-      width: 20px;
-      height: 20px;
-      animation: pulse-record 1.5s infinite;
-    }
-
-    @keyframes pulse-record {
-      0%, 100% { transform: scale(1); opacity: 1; }
-      50% { transform: scale(0.85); opacity: 0.7; }
-    }
-
-    .record-big-btn.paused .inner-dot {
-      background: #ff9800;
-      border-radius: 3px;
-      width: 8px;
-      height: 22px;
-      box-shadow: 10px 0 0 #ff9800;
-    }
-
-    .control-right {
-      flex: 1;
-    }
-
-    .control-btns {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 8px;
-    }
-
-    .ctrl-btn {
-      flex: 1;
-      background: #2d2d2d;
-      border: 1px solid #444;
-      color: #ccc;
-      padding: 7px 0;
-      border-radius: 6px;
-      font-size: 12px;
-      cursor: pointer;
-      transition: all 0.2s;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 4px;
-    }
-
-    .ctrl-btn:hover:not(:disabled) {
-      border-color: #666;
-      background: #3d3d3d;
-    }
-
-    .ctrl-btn:disabled {
-      opacity: 0.35;
-      cursor: not-allowed;
-    }
-
-    .ctrl-btn.danger:hover:not(:disabled) {
-      border-color: #e53935;
-      color: #e53935;
-    }
-
-    .ctrl-btn.warning:hover:not(:disabled) {
-      border-color: #ff9800;
-      color: #ff9800;
-    }
-
-    /* 实时信息 */
-    .realtime-info {
-      display: flex;
-      gap: 10px;
-    }
-
-    .info-chip {
-      background: #1a1a1a;
-      border: 1px solid #2d2d2d;
-      border-radius: 4px;
-      padding: 3px 8px;
-      font-size: 10px;
-      color: #888;
-      font-family: 'Courier New', monospace;
-    }
-
-    .info-chip span {
-      color: #4caf50;
-    }
-
-    .info-chip span.warn {
-      color: #ff9800;
-    }
-
-    /* ===== 选项卡 ===== */
-    .tabs {
-      display: flex;
-      background: #1a1a1a;
-      border-bottom: 1px solid #222;
-    }
-
-    .tab {
-      flex: 1;
-      padding: 8px;
-      text-align: center;
-      font-size: 12px;
-      color: #888;
-      cursor: pointer;
-      border-bottom: 2px solid transparent;
-      transition: all 0.2s;
-    }
-
-    .tab:hover {
-      color: #ccc;
-      background: #222;
-    }
-
-    .tab.active {
-      color: #fff;
-      border-bottom-color: #e53935;
-      background: #222;
-    }
-
-    /* ===== 面板内容 ===== */
-    .panel {
-      display: none;
-      padding: 12px 14px;
-      max-height: 320px;
-      overflow-y: auto;
-    }
-
-    .panel.active {
-      display: block;
-    }
-
-    .panel::-webkit-scrollbar {
-      width: 4px;
-    }
-
-    .panel::-webkit-scrollbar-track {
-      background: #111;
-    }
-
-    .panel::-webkit-scrollbar-thumb {
-      background: #444;
-      border-radius: 2px;
-    }
-
-    /* 选项区域 */
-    .option-group {
-      background: #1a1a1a;
-      border: 1px solid #2d2d2d;
-      border-radius: 8px;
-      padding: 12px;
-      margin-bottom: 10px;
-    }
-
-    .option-group-title {
-      font-size: 11px;
-      color: #e53935;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      margin-bottom: 10px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .option-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 6px 0;
-      border-bottom: 1px solid #222;
-      font-size: 12px;
-      color: #ccc;
-    }
-
-    .option-row:last-child {
-      border-bottom: none;
-      padding-bottom: 0;
-    }
-
-    .option-row label {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    select {
-      background: #2d2d2d;
-      border: 1px solid #444;
-      color: #fff;
-      padding: 4px 8px;
-      border-radius: 4px;
-      font-size: 11px;
-      cursor: pointer;
-      outline: none;
-    }
-
-    select:focus {
-      border-color: #e53935;
-    }
-
-    input[type="text"] {
-      background: #2d2d2d;
-      border: 1px solid #444;
-      color: #fff;
-      padding: 4px 8px;
-      border-radius: 4px;
-      font-size: 11px;
-      outline: none;
-      width: 140px;
-    }
-
-    input[type="text"]:focus {
-      border-color: #e53935;
-    }
-
-    /* 开关 */
-    .switch {
-      position: relative;
-      width: 36px;
-      height: 18px;
-      flex-shrink: 0;
-    }
-
-    .switch input {
-      opacity: 0;
-      width: 0;
-      height: 0;
-    }
-
-    .switch-slider {
-      position: absolute;
-      cursor: pointer;
-      inset: 0;
-      background: #444;
-      border-radius: 18px;
-      transition: 0.3s;
-    }
-
-    .switch-slider:before {
-      position: absolute;
-      content: "";
-      height: 12px;
-      width: 12px;
-      left: 3px;
-      bottom: 3px;
-      background: white;
-      border-radius: 50%;
-      transition: 0.3s;
-    }
-
-    input:checked + .switch-slider {
-      background: #e53935;
-    }
-
-    input:checked + .switch-slider:before {
-      transform: translateX(18px);
-    }
-
-    /* ===== 录制列表 ===== */
-    .recordings-list {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-
-    .rec-item {
-      background: #1a1a1a;
-      border: 1px solid #2d2d2d;
-      border-radius: 8px;
-      padding: 10px 12px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      transition: border-color 0.2s;
-    }
-
-    .rec-item:hover {
-      border-color: #444;
-    }
-
-    .rec-thumb {
-      width: 60px;
-      height: 40px;
-      background: #2d2d2d;
-      border-radius: 4px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 20px;
-      flex-shrink: 0;
-      overflow: hidden;
-    }
-
-    .rec-thumb video {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-    }
-
-    .rec-info {
-      flex: 1;
-      min-width: 0;
-    }
-
-    .rec-name {
-      font-size: 12px;
-      color: #fff;
-      font-weight: bold;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      margin-bottom: 3px;
-    }
-
-    .rec-meta {
-      font-size: 11px;
-      color: #666;
-      display: flex;
-      gap: 8px;
-    }
-
-    .rec-badge {
-      background: #2d2d2d;
-      border-radius: 3px;
-      padding: 1px 5px;
-      font-size: 10px;
-    }
-
-    .rec-actions {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-
-    .rec-btn {
-      background: #2d2d2d;
-      border: 1px solid #444;
-      color: #ccc;
-      padding: 3px 8px;
-      border-radius: 4px;
-      font-size: 11px;
-      cursor: pointer;
-      white-space: nowrap;
-      transition: all 0.2s;
-    }
-
-    .rec-btn:hover {
-      border-color: #e53935;
-      color: #e53935;
-    }
-
-    .rec-btn.download:hover {
-      border-color: #4caf50;
-      color: #4caf50;
-    }
-
-    .empty-list {
-      text-align: center;
-      color: #555;
-      padding: 30px 20px;
-      font-size: 13px;
-      line-height: 2;
-    }
-
-    /* ===== 底部状态栏 ===== */
-    .status-footer {
-      background: #111;
-      padding: 6px 14px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-top: 1px solid #222;
-    }
-
-    .status-left {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 11px;
-      color: #888;
-    }
-
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: #444;
-    }
-
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { width: 420px; font-family: 'Microsoft YaHei', Arial, sans-serif; background: #0d0d0d; color: #fff; overflow-x: hidden; }
+    .header { background: linear-gradient(135deg, #1a1a1a, #2d2d2d); padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; border-bottom: 2px solid #e53935; }
+    .header-left { display: flex; align-items: center; gap: 8px; }
+    .logo { width: 28px; height: 28px; background: linear-gradient(135deg, #e53935, #ff6f00); border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 16px; }
+    .header-title { font-size: 15px; font-weight: bold; color: #fff; }
+    .header-subtitle { font-size: 11px; color: #888; }
+    .header-right { display: flex; gap: 6px; }
+    .header-btn { background: transparent; border: none; color: #888; cursor: pointer; font-size: 14px; padding: 4px 6px; border-radius: 4px; transition: all 0.2s; }
+    .header-btn:hover { background: #333; color: #fff; }
+    .monitor-bar { background: #111; padding: 6px 14px; display: flex; align-items: center; gap: 14px; font-size: 11px; border-bottom: 1px solid #222; }
+    .monitor-item { display: flex; align-items: center; gap: 4px; color: #888; }
+    .monitor-value { color: #4caf50; font-family: 'Courier New', monospace; font-weight: bold; }
+    .monitor-value.recording { color: #ff4444; }
+    .record-time-display { margin-left: auto; font-family: 'Courier New', monospace; font-size: 16px; font-weight: bold; color: #ff4444; letter-spacing: 2px; }
+    .record-time-display.idle { color: #555; }
+    .quality-bar { background: #1a1a1a; padding: 8px 14px; display: flex; align-items: center; gap: 6px; border-bottom: 1px solid #222; }
+    .quality-btn { background: #2d2d2d; border: 1px solid #444; color: #ccc; padding: 5px 14px; border-radius: 4px; font-size: 12px; cursor: pointer; transition: all 0.2s; font-weight: bold; }
+    .quality-btn:hover { border-color: #e53935; color: #fff; }
+    .quality-btn.active { background: linear-gradient(135deg, #1565c0, #0d47a1); border-color: #2196f3; color: #fff; box-shadow: 0 0 8px rgba(33, 150, 243, 0.4); }
+    .quality-btn.uhd.active { background: linear-gradient(135deg, #6a1b9a, #4a148c); border-color: #9c27b0; box-shadow: 0 0 8px rgba(156, 39, 176, 0.4); }
+    .region-btn { margin-left: auto; background: #2d2d2d; border: 1px solid #444; color: #ccc; padding: 5px 12px; border-radius: 4px; font-size: 12px; cursor: pointer; transition: all 0.2s; }
+    .region-btn:hover, .region-btn.active { border-color: #ff9800; color: #ff9800; background: #ff980011; }
+    .main-control { background: #111; padding: 14px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #222; }
+    .record-big-btn { width: 52px; height: 52px; border-radius: 50%; border: 3px solid #e53935; background: transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.3s; position: relative; flex-shrink: 0; }
+    .record-big-btn:hover { box-shadow: 0 0 20px rgba(229, 57, 53, 0.6); }
+    .record-big-btn .inner-dot { width: 26px; height: 26px; border-radius: 50%; background: #e53935; transition: all 0.3s; }
+    .record-big-btn.recording .inner-dot { border-radius: 4px; width: 20px; height: 20px; animation: pulse-record 1.5s infinite; }
+    @keyframes pulse-record { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(0.85); opacity: 0.7; } }
+    .record-big-btn.paused .inner-dot { background: #ff9800; border-radius: 3px; width: 8px; height: 22px; box-shadow: 10px 0 0 #ff9800; }
+    .control-right { flex: 1; }
+    .control-btns { display: flex; gap: 8px; margin-bottom: 8px; }
+    .ctrl-btn { flex: 1; background: #2d2d2d; border: 1px solid #444; color: #ccc; padding: 7px 0; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 4px; }
+    .ctrl-btn:hover:not(:disabled) { border-color: #666; background: #3d3d3d; }
+    .ctrl-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    .ctrl-btn.danger:hover:not(:disabled) { border-color: #e53935; color: #e53935; }
+    .ctrl-btn.warning:hover:not(:disabled) { border-color: #ff9800; color: #ff9800; }
+    .realtime-info { display: flex; gap: 10px; }
+    .info-chip { background: #1a1a1a; border: 1px solid #2d2d2d; border-radius: 4px; padding: 3px 8px; font-size: 10px; color: #888; font-family: 'Courier New', monospace; }
+    .info-chip span { color: #4caf50; }
+    .tabs { display: flex; background: #1a1a1a; border-bottom: 1px solid #222; }
+    .tab { flex: 1; padding: 8px; text-align: center; font-size: 12px; color: #888; cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s; }
+    .tab:hover { color: #ccc; background: #222; }
+    .tab.active { color: #fff; border-bottom-color: #e53935; background: #222; }
+    .panel { display: none; padding: 12px 14px; max-height: 320px; overflow-y: auto; }
+    .panel.active { display: block; }
+    .panel::-webkit-scrollbar { width: 4px; }
+    .panel::-webkit-scrollbar-track { background: #111; }
+    .panel::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
+    .option-group { background: #1a1a1a; border: 1px solid #2d2d2d; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+    .option-group-title { font-size: 11px; color: #e53935; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }
+    .option-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #222; font-size: 12px; color: #ccc; }
+    .option-row:last-child { border-bottom: none; padding-bottom: 0; }
+    .option-row label { display: flex; align-items: center; gap: 6px; }
+    select { background: #2d2d2d; border: 1px solid #444; color: #fff; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; outline: none; }
+    select:focus { border-color: #e53935; }
+    input[type="text"] { background: #2d2d2d; border: 1px solid #444; color: #fff; padding: 4px 8px; border-radius: 4px; font-size: 11px; outline: none; width: 140px; }
+    input[type="text"]:focus { border-color: #e53935; }
+    .switch { position: relative; width: 36px; height: 18px; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch-slider { position: absolute; cursor: pointer; inset: 0; background: #444; border-radius: 18px; transition: 0.3s; }
+    .switch-slider:before { position: absolute; content: ""; height: 12px; width: 12px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: 0.3s; }
+    input:checked + .switch-slider { background: #e53935; }
+    input:checked + .switch-slider:before { transform: translateX(18px); }
+    .rec-progress { background: #1a1a1a; border: 1px solid #2d2d2d; border-radius: 8px; padding: 12px; margin-bottom: 10px; display: none; }
+    .rec-progress.show { display: block; }
+    .progress-label { display: flex; justify-content: space-between; font-size: 11px; color: #888; margin-bottom: 6px; }
+    .progress-track { height: 4px; background: #2d2d2d; border-radius: 2px; overflow: hidden; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, #e53935, #ff6f00); border-radius: 2px; width: 0%; transition: width 0.5s; }
+    .shortcut-hint { font-size: 10px; color: #555; text-align: center; padding: 4px; }
+    kbd { background: #2d2d2d; border: 1px solid #444; border-radius: 3px; padding: 1px 4px; font-size: 10px; color: #888; }
+    .status-footer { background: #111; padding: 6px 14px; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid #222; }
+    .status-left { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #888; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #444; }
     .status-dot.ready { background: #4caf50; }
-    .status-dot.recording { 
-      background: #e53935; 
-      animation: blink 1s infinite;
-    }
+    .status-dot.recording { background: #e53935; animation: blink 1s infinite; }
     .status-dot.paused { background: #ff9800; }
     .status-dot.error { background: #f44336; }
-
-    @keyframes blink {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.2; }
-    }
-
-    .status-right {
-      display: flex;
-      gap: 10px;
-    }
-
-    .foot-btn {
-      background: transparent;
-      border: none;
-      color: #666;
-      cursor: pointer;
-      font-size: 11px;
-      transition: color 0.2s;
-      display: flex;
-      align-items: center;
-      gap: 3px;
-    }
-
-    .foot-btn:hover {
-      color: #ccc;
-    }
-
-    /* ===== Toast 提示 ===== */
-    .toast {
-      position: fixed;
-      bottom: 60px;
-      left: 50%;
-      transform: translateX(-50%);
-      background: rgba(30, 30, 30, 0.95);
-      border: 1px solid #444;
-      color: #fff;
-      padding: 8px 16px;
-      border-radius: 6px;
-      font-size: 12px;
-      white-space: nowrap;
-      opacity: 0;
-      transition: opacity 0.3s;
-      z-index: 9999;
-      pointer-events: none;
-    }
-
-    .toast.show {
-      opacity: 1;
-    }
-
-    /* ===== 错误提示 ===== */
-    .error-banner {
-      background: #2d1515;
-      border: 1px solid #e53935;
-      border-radius: 6px;
-      padding: 10px 12px;
-      font-size: 12px;
-      color: #ef9a9a;
-      margin-bottom: 10px;
-      display: none;
-    }
-
-    .error-banner.show {
-      display: block;
-    }
-
-    /* 进度条 */
-    .rec-progress {
-      background: #1a1a1a;
-      border: 1px solid #2d2d2d;
-      border-radius: 8px;
-      padding: 12px;
-      margin-bottom: 10px;
-      display: none;
-    }
-
-    .rec-progress.show { display: block; }
-
-    .progress-label {
-      display: flex;
-      justify-content: space-between;
-      font-size: 11px;
-      color: #888;
-      margin-bottom: 6px;
-    }
-
-    .progress-track {
-      height: 4px;
-      background: #2d2d2d;
-      border-radius: 2px;
-      overflow: hidden;
-    }
-
-    .progress-fill {
-      height: 100%;
-      background: linear-gradient(90deg, #e53935, #ff6f00);
-      border-radius: 2px;
-      width: 0%;
-      transition: width 0.5s;
-    }
-
-    /* 快捷键提示 */
-    .shortcut-hint {
-      font-size: 10px;
-      color: #555;
-      text-align: center;
-      padding: 4px;
-    }
-
-    kbd {
-      background: #2d2d2d;
-      border: 1px solid #444;
-      border-radius: 3px;
-      padding: 1px 4px;
-      font-size: 10px;
-      color: #888;
-    }
+    @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+    .status-right { display: flex; gap: 10px; }
+    .foot-btn { background: transparent; border: none; color: #666; cursor: pointer; font-size: 11px; transition: color 0.2s; display: flex; align-items: center; gap: 3px; }
+    .foot-btn:hover { color: #ccc; }
+    .toast { position: fixed; bottom: 60px; left: 50%; transform: translateX(-50%); background: rgba(30, 30, 30, 0.95); border: 1px solid #444; color: #fff; padding: 8px 16px; border-radius: 6px; font-size: 12px; white-space: nowrap; opacity: 0; transition: opacity 0.3s; z-index: 9999; pointer-events: none; }
+    .toast.show { opacity: 1; }
+    .error-banner { background: #2d1515; border: 1px solid #e53935; border-radius: 6px; padding: 10px 12px; font-size: 12px; color: #ef9a9a; margin-bottom: 10px; display: none; }
+    .error-banner.show { display: block; }
   </style>
 </head>
 <body>
@@ -740,58 +104,40 @@
       </div>
     </div>
     <div class="header-right">
-      <button class="header-btn" title="设置" onclick="switchTab('settings')">⚙️</button>
-      <button class="header-btn" title="关于" onclick="showAbout()">ℹ️</button>
+      <button class="header-btn" title="设置" id="btnGoSettings">⚙️</button>
+      <button class="header-btn" title="关于" id="btnGoAbout">ℹ️</button>
     </div>
   </div>
 
   <!-- 实时监控栏 -->
   <div class="monitor-bar">
-    <div class="monitor-item">
-      CPU <span class="monitor-value" id="monCpu">0%</span>
-    </div>
-    <div class="monitor-item">
-      FPS <span class="monitor-value" id="monFps">0</span>
-    </div>
-    <div class="monitor-item">
-      速率 <span class="monitor-value" id="monBitrate">0kbps</span>
-    </div>
-    <div class="monitor-item">
-      大小 <span class="monitor-value recording" id="monSize">0.00M</span>
-    </div>
-    <div class="monitor-item">
-      分辨率 <span class="monitor-value" id="monRes">-</span>
-    </div>
-    <div class="record-time-display idle" id="mainTimer">00:00:000</div>
+    <div class="monitor-item">CPU <span class="monitor-value" id="monCpu">0%</span></div>
+    <div class="monitor-item">FPS <span class="monitor-value" id="monFps">0</span></div>
+    <div class="monitor-item">速率 <span class="monitor-value" id="monBitrate">0kbps</span></div>
+    <div class="monitor-item">大小 <span class="monitor-value recording" id="monSize">0.00M</span></div>
+    <div class="monitor-item">分辨率 <span class="monitor-value" id="monRes">-</span></div>
+    <div class="record-time-display idle" id="mainTimer">00:00:00</div>
   </div>
 
   <!-- 质量选择栏 -->
   <div class="quality-bar">
-    <button class="quality-btn uhd" id="qUHD" onclick="setQuality('uhd')">超清录制</button>
-    <button class="quality-btn active" id="qHD" onclick="setQuality('hd')">高清录制</button>
-    <button class="quality-btn" id="qSD" onclick="setQuality('sd')">标清录制</button>
-    <button class="region-btn" id="regionBtn" onclick="toggleRegionMode()">
-      🔲 区域录制模式
-    </button>
+    <button class="quality-btn" id="qUHD">超清录制</button>
+    <button class="quality-btn active" id="qHD">高清录制</button>
+    <button class="quality-btn" id="qSD">标清录制</button>
+    <button class="region-btn" id="regionBtn">🔲 区域录制模式</button>
   </div>
 
   <!-- 主控制区 -->
   <div class="main-control">
-    <button class="record-big-btn" id="mainRecBtn" onclick="toggleMainRecord()">
+    <button class="record-big-btn" id="mainRecBtn">
       <div class="inner-dot"></div>
     </button>
 
     <div class="control-right">
       <div class="control-btns">
-        <button class="ctrl-btn warning" id="btnPause" disabled onclick="pauseResume()">
-          ⏸ 暂停
-        </button>
-        <button class="ctrl-btn danger" id="btnStop" disabled onclick="stopRecording()">
-          ⏹ 停止
-        </button>
-        <button class="ctrl-btn" onclick="switchTab('files')">
-          📂 文件列表
-        </button>
+        <button class="ctrl-btn warning" id="btnPause" disabled>⏸ 暂停</button>
+        <button class="ctrl-btn danger" id="btnStop" disabled>⏹ 停止</button>
+        <button class="ctrl-btn" id="btnGoFiles">📂 文件列表</button>
       </div>
 
       <div class="realtime-info">
@@ -810,17 +156,14 @@
 
   <!-- 选项卡 -->
   <div class="tabs">
-    <div class="tab active" onclick="switchTab('options')" id="tab-options">⚙️ 录制选项</div>
-    <div class="tab" onclick="switchTab('files')" id="tab-files">📂 录制文件</div>
-    <div class="tab" onclick="switchTab('settings')" id="tab-settings">🔧 高级设置</div>
+    <div class="tab active" id="tab-options">⚙️ 录制选项</div>
+    <div class="tab" id="tab-files">📂 录制文件</div>
+    <div class="tab" id="tab-settings">🔧 高级设置</div>
   </div>
 
   <!-- 面板：录制选项 -->
   <div class="panel active" id="panel-options">
-    
-    <div id="errorBanner" class="error-banner">
-      ⚠️ <span id="errorMsg">录制出现错误</span>
-    </div>
+    <div id="errorBanner" class="error-banner">⚠️ <span id="errorMsg">录制出现错误</span></div>
 
     <div class="rec-progress" id="recProgress">
       <div class="progress-label">
@@ -834,7 +177,6 @@
 
     <div class="option-group">
       <div class="option-group-title">🎥 视频设置</div>
-      
       <div class="option-row">
         <label>📡 录制源</label>
         <select id="captureMode">
@@ -842,7 +184,6 @@
           <option value="display">全屏/应用窗口</option>
         </select>
       </div>
-
       <div class="option-row">
         <label>📐 输出分辨率</label>
         <select id="resolutionSelect">
@@ -852,7 +193,6 @@
           <option value="480">480p</option>
         </select>
       </div>
-
       <div class="option-row">
         <label>🎞️ 帧率</label>
         <select id="fpsSelect">
@@ -862,19 +202,18 @@
           <option value="15">15 FPS（省空间）</option>
         </select>
       </div>
-
       <div class="option-row">
         <label>📦 输出格式</label>
         <select id="formatSelect">
-          <option value="webm">WebM（VP9+Opus）</option>
-          <option value="webm-h264">WebM（H264+AAC）</option>
+          <option value="mp4">MP4 (H264+AAC - 推荐，极度流畅)</option>
+          <option value="webm">WebM (H264+Opus - 流畅)</option>
+          <option value="webm-vp9">WebM (VP9+Opus - 高压/易卡)</option>
         </select>
       </div>
     </div>
 
     <div class="option-group">
       <div class="option-group-title">🎵 音频设置</div>
-
       <div class="option-row">
         <label>🔊 录制系统/网页声音</label>
         <label class="switch">
@@ -882,7 +221,6 @@
           <span class="switch-slider"></span>
         </label>
       </div>
-
       <div class="option-row">
         <label>🎙️ 混入麦克风</label>
         <label class="switch">
@@ -890,7 +228,6 @@
           <span class="switch-slider"></span>
         </label>
       </div>
-
       <div class="option-row">
         <label>🔇 仅录视频（无声）</label>
         <label class="switch">
@@ -898,7 +235,6 @@
           <span class="switch-slider"></span>
         </label>
       </div>
-
       <div class="option-row">
         <label>🎚️ 音频通道</label>
         <select id="audioChannels">
@@ -914,9 +250,7 @@
     <div class="recordings-list" id="recordingsList">
       <div class="empty-list">
         🎬 暂无录制文件<br>
-        <span style="font-size: 12px; color: #666;">
-          点击红色按钮开始录制直播视频
-        </span>
+        <span style="font-size: 12px; color: #666;">点击红色按钮或通过侧边悬浮栏开始录制</span>
       </div>
     </div>
   </div>
@@ -925,7 +259,6 @@
   <div class="panel" id="panel-settings">
     <div class="option-group">
       <div class="option-group-title">💾 保存设置</div>
-
       <div class="option-row">
         <label>📁 自动保存到下载</label>
         <label class="switch">
@@ -933,12 +266,10 @@
           <span class="switch-slider"></span>
         </label>
       </div>
-
       <div class="option-row">
         <label>📝 文件名前缀</label>
-        <input type="text" id="filePrefix" value="直播录制" placeholder="自定义前缀">
+        <input type="text" id="filePrefix" value="直播录制">
       </div>
-
       <div class="option-row">
         <label>🗂️ 文件命名规则</label>
         <select id="fileNaming">
@@ -951,7 +282,6 @@
 
     <div class="option-group">
       <div class="option-group-title">⏱️ 录制限制</div>
-
       <div class="option-row">
         <label>⏱️ 最长录制时长</label>
         <select id="maxDuration">
@@ -962,7 +292,6 @@
           <option value="7200">2小时</option>
         </select>
       </div>
-
       <div class="option-row">
         <label>💾 分段录制（MB）</label>
         <select id="segmentSize">
@@ -972,7 +301,6 @@
           <option value="2000">2 GB</option>
         </select>
       </div>
-
       <div class="option-row">
         <label>🔔 录制提示</label>
         <label class="switch">
@@ -984,7 +312,6 @@
 
     <div class="option-group">
       <div class="option-group-title">🪟 悬浮窗</div>
-
       <div class="option-row">
         <label>显示悬浮录制控制条</label>
         <label class="switch">
@@ -992,7 +319,6 @@
           <span class="switch-slider"></span>
         </label>
       </div>
-
       <div class="option-row">
         <label>悬浮窗位置</label>
         <select id="floatPosition">
@@ -1003,18 +329,8 @@
           <option value="bottom-center">底部居中</option>
         </select>
       </div>
-
-      <div class="option-row">
-        <label style="width:100%;">
-          <button onclick="applyFloatWindow()" style="
-            width:100%; background:#2d2d2d; border:1px solid #444;
-            color:#ccc; padding:7px; border-radius:6px; cursor:pointer;
-            font-size:12px; transition:all 0.2s;
-          " onmouseover="this.style.borderColor='#e53935'" 
-             onmouseout="this.style.borderColor='#444'">
-            🪟 在当前页面显示悬浮控制条
-          </button>
-        </label>
+      <div class="option-row" style="margin-top:10px;">
+        <button id="btnApplyFloat" style="width:100%; background:#2d2d2d; border:1px solid #444; color:#ccc; padding:7px; border-radius:6px; cursor:pointer; font-size:12px;">🪟 在当前页面显示悬浮控制条</button>
       </div>
     </div>
   </div>
@@ -1026,12 +342,11 @@
       <span id="statusText">就绪</span>
     </div>
     <div class="status-right">
-      <button class="foot-btn" onclick="clearAllRecordings()">🗑️ 清空</button>
-      <button class="foot-btn" onclick="openDownloadFolder()">📁 下载目录</button>
+      <button class="foot-btn" id="btnClearAll">🗑️ 清空</button>
+      <button class="foot-btn" id="btnOpenDownloads">📁 下载目录</button>
     </div>
   </div>
 
-  <!-- Toast -->
   <div class="toast" id="toast"></div>
 
   <script src="popup.js"></script>
