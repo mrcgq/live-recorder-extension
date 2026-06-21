@@ -2,9 +2,10 @@
 
 // ============================================================
 // popup.js - 纯控制面（Stateless View）
-// 修复：
-//   1. 移除全部 inline 事件，使用程序化绑定（阻断 CSP 拦截）
-//   2. 引入 chrome.storage.local 双向双通道持久化，防止配置复位（Law-03/40）
+// 职责：
+//   1. 彻底移除所有 inline onclick（遵守 MV3 严苛的 CSP 限制）
+//   2. 采用双向数据持久化，确保参数重启弹窗后永不丢失（对齐 Law-03/40）
+//   3. 添加空安全保护防御 `null` 节点异常（对齐 Law-11/12）
 // ============================================================
 
 const $ = (id) => document.getElementById(id);
@@ -15,8 +16,8 @@ const QUALITY = {
   sd : { label: '标清', vbps:  2_500_000, abps: 128_000, w: 1280, h:  720, fps: 30 },
 };
 
-// 16个核心双向同步参数配置项
-const SYNC_CONFIG_KEYS = [
+// 16项核心持久化配置项（双通道自动存储机制）
+const PERSISTENT_KEYS = [
   'captureMode', 'resolutionSelect', 'fpsSelect', 'formatSelect',
   'sysAudio', 'micAudio', 'noAudio', 'audioChannels',
   'autoDownload', 'filePrefix', 'fileNaming', 'maxDuration',
@@ -33,42 +34,87 @@ let bgPort = null;
 let _toastTimer = null;
 
 // ============================================================
-// 建立长连接
+// 1. 本地配置加载与持久化逻辑
+// ============================================================
+async function loadConfigFromStorage() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(PERSISTENT_KEYS, (stored) => {
+      // 安全读取，空防线守卫 (Law-11)
+      if (stored.captureMode !== undefined && $('captureMode'))           $('captureMode').value = stored.captureMode;
+      if (stored.resolutionSelect !== undefined && $('resolutionSelect')) $('resolutionSelect').value = stored.resolutionSelect;
+      if (stored.fpsSelect !== undefined && $('fpsSelect'))               $('fpsSelect').value = stored.fpsSelect;
+      if (stored.formatSelect !== undefined && $('formatSelect'))         $('formatSelect').value = stored.formatSelect;
+      
+      if (stored.sysAudio !== undefined && $('sysAudio'))                 $('sysAudio').checked = stored.sysAudio;
+      if (stored.micAudio !== undefined && $('micAudio'))                 $('micAudio').checked = stored.micAudio;
+      if (stored.noAudio !== undefined && $('noAudio'))                   $('noAudio').checked = stored.noAudio;
+      if (stored.audioChannels !== undefined && $('audioChannels'))       $('audioChannels').value = stored.audioChannels;
+      
+      if (stored.autoDownload !== undefined && $('autoDownload'))         $('autoDownload').checked = stored.autoDownload;
+      if (stored.filePrefix !== undefined && $('filePrefix'))             $('filePrefix').value = stored.filePrefix;
+      if (stored.fileNaming !== undefined && $('fileNaming'))             $('fileNaming').value = stored.fileNaming;
+      
+      if (stored.maxDuration !== undefined && $('maxDuration'))           $('maxDuration').value = stored.maxDuration;
+      if (stored.segmentSize !== undefined && $('segmentSize'))           $('segmentSize').value = stored.segmentSize;
+      if (stored.showNotify !== undefined && $('showNotify'))             $('showNotify').checked = stored.showNotify;
+      if (stored.showFloat !== undefined && $('showFloat'))               $('showFloat').checked = stored.showFloat;
+      if (stored.floatPosition !== undefined && $('floatPosition'))       $('floatPosition').value = stored.floatPosition;
+
+      // 读取并高亮上次选择的清晰度
+      chrome.storage.local.get(['quality'], (res) => {
+        if (res.quality) {
+          UI.quality = res.quality;
+          syncQualityActiveBtn(res.quality);
+        }
+        resolve();
+      });
+    });
+  });
+}
+
+function saveConfigToStorage() {
+  const config = {};
+  PERSISTENT_KEYS.forEach(key => {
+    const el = $(key);
+    if (!el) return;
+    config[key] = el.type === 'checkbox' ? el.checked : el.value;
+  });
+  config.quality = UI.quality;
+  chrome.storage.local.set(config);
+}
+
+// ============================================================
+// 2. 长连接与指标同步 (Law-46)
 // ============================================================
 function connectBackground() {
   try {
     bgPort = chrome.runtime.connect({ name: 'popup' });
-    bgPort.onMessage.addListener(onBgMessage);
+
+    bgPort.onMessage.addListener((msg) => {
+      if (msg.action === 'stateSync') {
+        applyState(msg.state);
+      }
+      if (msg.action === 'metricsUpdate') {
+        applyMetrics(msg);
+      }
+    });
+
     bgPort.onDisconnect.addListener(() => {
       bgPort = null;
       setTimeout(connectBackground, 800);
     });
   } catch (e) {
-    console.warn('[popup] connect background failed:', e.message);
+    console.warn('[popup] background connection error:', e.message);
     setTimeout(connectBackground, 1000);
   }
 }
 
-function onBgMessage(msg) {
-  switch (msg.action) {
-    case 'stateSync':
-      if (msg.state) applyState(msg.state);
-      break;
-    case 'metricsUpdate':
-      applyMetrics(msg);
-      break;
-  }
-}
-
-// ============================================================
-// 状态同步至视图层
-// ============================================================
 function applyState(state) {
   UI.isRecording = !!state.isRecording;
   UI.isPaused    = !!state.isPaused;
   if (state.quality) {
     UI.quality = state.quality;
-    updateQualityActiveBtn(state.quality);
+    syncQualityActiveBtn(state.quality);
   }
 
   updateBtnUI();
@@ -108,73 +154,70 @@ function applyMetrics(msg) {
   }
   if (msg.bitrate)    $('monBitrate').textContent = msg.bitrate;
   if (msg.resolution) $('monRes').textContent     = msg.resolution;
+  if (msg.fps)        $('monFps').textContent     = msg.fps;
+  if (msg.cpu)        $('monCpu').textContent     = msg.cpu;
 
   updateBtnUI();
 }
 
 // ============================================================
-// 双通道数据持久化（对齐 Law-03 单一真相源）
+// 3. 事件注册绑定（完全移除 inline，抗击 CSP 拦截）
 // ============================================================
-async function loadPersistentConfig() {
-  return new Promise((resolve) => {
-    chrome.storage.local.get(SYNC_CONFIG_KEYS, (stored) => {
-      if (stored.captureMode !== undefined)      $('captureMode').value = stored.captureMode;
-      if (stored.resolutionSelect !== undefined) $('resolutionSelect').value = stored.resolutionSelect;
-      if (stored.fpsSelect !== undefined)        $('fpsSelect').value = stored.fpsSelect;
-      if (stored.formatSelect !== undefined)     $('formatSelect').value = stored.formatSelect;
-      
-      if (stored.sysAudio !== undefined)         $('sysAudio').checked = stored.sysAudio;
-      if (stored.micAudio !== undefined)         $('micAudio').checked = stored.micAudio;
-      if (stored.noAudio !== undefined)          $('noAudio').checked = stored.noAudio;
-      if (stored.audioChannels !== undefined)    $('audioChannels').value = stored.audioChannels;
-      
-      if (stored.autoDownload !== undefined)     $('autoDownload').checked = stored.autoDownload;
-      if (stored.filePrefix !== undefined)       $('filePrefix').value = stored.filePrefix;
-      if (stored.fileNaming !== undefined)       $('fileNaming').value = stored.fileNaming;
-      
-      if (stored.maxDuration !== undefined)      $('maxDuration').value = stored.maxDuration;
-      if (stored.segmentSize !== undefined)      $('segmentSize').value = stored.segmentSize;
-      if (stored.showNotify !== undefined)       $('showNotify').checked = stored.showNotify;
-      if (stored.showFloat !== undefined)        $('showFloat').checked = stored.showFloat;
-      if (stored.floatPosition !== undefined)    $('floatPosition').value = stored.floatPosition;
+function bindUIEvents() {
+  // 选项卡切换绑定
+  $('tab-options').addEventListener('click', () => switchTab('options'));
+  $('tab-files').addEventListener('click', () => switchTab('files'));
+  $('tab-settings').addEventListener('click', () => switchTab('settings'));
 
-      // 同步品质高亮
-      chrome.storage.local.get(['quality'], (res) => {
-        if (res.quality) {
-          UI.quality = res.quality;
-          updateQualityActiveBtn(res.quality);
-        }
-        resolve();
-      });
+  // 精准按钮与跳转
+  $('btnGoSettings').addEventListener('click', () => switchTab('settings'));
+  $('btnGoFiles').addEventListener('click', () => switchTab('files'));
+  $('btnGoAbout').addEventListener('click', showAbout);
+
+  // 清晰度按钮
+  $('qUHD').addEventListener('click', () => setQuality('uhd'));
+  $('qHD').addEventListener('click', () => setQuality('hd'));
+  $('qSD').addEventListener('click', () => setQuality('sd'));
+
+  // 区域录制与控制中心
+  $('regionBtn').addEventListener('click', toggleRegionMode);
+  $('mainRecBtn').addEventListener('click', toggleMainRecord);
+  $('btnPause').addEventListener('click', pauseResume);
+  $('btnStop').addEventListener('click', stopRecording);
+
+  // 悬浮窗显示按钮（★ 修复：此时元素在 HTML 中已拥有正确的 ID）
+  if ($('btnApplyFloat')) {
+    $('btnApplyFloat').addEventListener('click', applyFloatWindow);
+  }
+
+  // 底部清除与下载目录
+  $('btnClearAll').addEventListener('click', clearAllRecordings);
+  $('btnOpenDownloads').addEventListener('click', openDownloadFolder);
+
+  // 双向配置侦听与保存绑定
+  PERSISTENT_KEYS.forEach((key) => {
+    const el = $(key);
+    if (!el) return;
+
+    el.addEventListener('change', () => {
+      // 声音选项互斥判定
+      if (key === 'noAudio' && el.checked) {
+        $('sysAudio').checked = false;
+        $('micAudio').checked = false;
+      }
+      if ((key === 'sysAudio' || key === 'micAudio') && el.checked) {
+        $('noAudio').checked = false;
+      }
+      saveConfigToStorage();
     });
   });
-}
 
-function savePersistentConfig() {
-  const config = {
-    captureMode:      $('captureMode').value,
-    resolutionSelect: $('resolutionSelect').value,
-    fpsSelect:        $('fpsSelect').value,
-    formatSelect:     $('formatSelect').value,
-    sysAudio:         $('sysAudio').checked,
-    micAudio:         $('micAudio').checked,
-    noAudio:          $('noAudio').checked,
-    audioChannels:    $('audioChannels').value,
-    autoDownload:     $('autoDownload').checked,
-    filePrefix:       $('filePrefix').value,
-    fileNaming:       $('fileNaming').value,
-    maxDuration:      $('maxDuration').value,
-    segmentSize:      $('segmentSize').value,
-    showNotify:       $('showNotify').checked,
-    showFloat:        $('showFloat').checked,
-    floatPosition:    $('floatPosition').value,
-    quality:          UI.quality
-  };
-  chrome.storage.local.set(config);
+  // 输入框实时写入
+  $('filePrefix').addEventListener('input', saveConfigToStorage);
 }
 
 // ============================================================
-// 录制动作控制
+// 4. 指令发射中枢
 // ============================================================
 function sendCmd(action, extra) {
   const msg = Object.assign({ action }, extra || {});
@@ -229,18 +272,17 @@ function pauseResume() {
   if (UI.isPaused) {
     sendCmd('resumeRecording');
     UI.isPaused = false;
-    $('btnPause').innerHTML = '⏸ 暂停';
+    $('btnPause').textContent = '⏸ 暂停';
     setStatus('recording', '🔴 录制中');
-    startTimer();
     toast('▶️ 继续录制');
   } else {
     sendCmd('pauseRecording');
     UI.isPaused = true;
-    $('btnPause').innerHTML = '▶️ 继续';
+    $('btnPause').textContent = '▶️ 继续';
     setStatus('paused', '⏸ 已暂停');
-    stopTimer();
     toast('⏸ 录制已暂停');
   }
+
   updateBtnUI();
 }
 
@@ -264,74 +306,18 @@ function buildConfig() {
 }
 
 // ============================================================
-// 程序化事件绑定（100% 阻断 CSP 安全异常）
-// ============================================================
-function bindUIEvents() {
-  // Tab面板选择
-  $('tab-options').addEventListener('click', () => switchTab('options'));
-  $('tab-files').addEventListener('click', () => switchTab('files'));
-  $('tab-settings').addEventListener('click', () => switchTab('settings'));
-
-  // 快捷跳转
-  $('btnGoSettings').addEventListener('click', () => switchTab('settings'));
-  $('btnGoFiles').addEventListener('click', () => switchTab('files'));
-  $('btnGoAbout').addEventListener('click', showAbout);
-
-  // 质量选择按钮
-  $('qUHD').addEventListener('click', () => setQuality('uhd'));
-  $('qHD').addEventListener('click', () => setQuality('hd'));
-  $('qSD').addEventListener('click', () => setQuality('sd'));
-
-  // 区域录制按钮
-  $('regionBtn').addEventListener('click', toggleRegionMode);
-
-  // 主控制面按钮
-  $('mainRecBtn').addEventListener('click', toggleMainRecord);
-  $('btnPause').addEventListener('click', pauseResume);
-  $('btnStop').addEventListener('click', stopRecording);
-
-  // 悬浮条应用按钮
-  $('btnApplyFloat').addEventListener('click', applyFloatWindow);
-
-  // 底部控制
-  $('btnClearAll').addEventListener('click', clearAllRecordings);
-  $('btnOpenDownloads').addEventListener('click', openDownloadFolder);
-
-  // 动态内容双向观察器注册
-  SYNC_CONFIG_KEYS.forEach((id) => {
-    const el = $(id);
-    if (!el) return;
-
-    el.addEventListener('change', () => {
-      // 声音选项互斥处理
-      if (id === 'noAudio' && el.checked) {
-        $('sysAudio').checked = false;
-        $('micAudio').checked = false;
-      }
-      if ((id === 'sysAudio' || id === 'micAudio') && el.checked) {
-        $('noAudio').checked = false;
-      }
-      savePersistentConfig();
-    });
-  });
-
-  // 输入框实时写入
-  $('filePrefix').addEventListener('input', savePersistentConfig);
-}
-
-// ============================================================
-// 辅助函数
+// 5. 辅助与面板切换
 // ============================================================
 function setQuality(q) {
   UI.quality = q;
-  updateQualityActiveBtn(q);
-  savePersistentConfig();
+  syncQualityActiveBtn(q);
+  saveConfigToStorage();
   const p = QUALITY[q];
   if ($('monRes')) $('monRes').textContent = p.w + '×' + p.h;
   toast('✅ 已切换到 ' + p.label + ' 模式');
 }
 
-function updateQualityActiveBtn(q) {
+function syncQualityActiveBtn(q) {
   ['uhd', 'hd', 'sd'].forEach((k) => {
     const btn = $('q' + k.toUpperCase());
     if (btn) btn.classList.toggle('active', k === q);
@@ -350,8 +336,10 @@ function updateBtnUI() {
     btn.className = 'record-big-btn';
   }
 
-  $('btnPause').disabled = !UI.isRecording;
-  $('btnStop').disabled  = !UI.isRecording;
+  const pb = $('btnPause');
+  const sb = $('btnStop');
+  if (pb) pb.disabled = !UI.isRecording;
+  if (sb) sb.disabled = !UI.isRecording;
 }
 
 function setStatus(type, text) {
@@ -408,11 +396,24 @@ function showAbout() {
   toast('直播内录器 v2.1 Pro | Offscreen闭环 | 关闭弹窗不中断录制');
 }
 
+function openDownloadFolder() {
+  chrome.downloads.showDefaultFolder();
+}
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
+  const t = $('tab-' + name);
+  const p = $('panel-' + name);
+  if (t) t.classList.add('active');
+  if (p) p.classList.add('active');
+}
+
 // ============================================================
 // 初始化
 // ============================================================
 document.addEventListener('DOMContentLoaded', async () => {
   bindUIEvents();
-  await loadPersistentConfig();
+  await loadConfigFromStorage();
   connectBackground();
 });
