@@ -35,18 +35,30 @@ let bgPort = null;
 function connectBackground() {
   bgPort = chrome.runtime.connect({ name: 'popup' });
   bgPort.onMessage.addListener((msg) => {
-    // 接收来自 background 转发的消息
-    if (msg.action === 'floatPause')     pauseResume();
-    if (msg.action === 'floatStop')      stopRecording();
-    if (msg.action === 'hotkeyToggle')   toggleMainRecord();
-    if (msg.action === 'hotkeyPause')    pauseResume();
+    if (msg.action === 'floatPause')    pauseResume();
+    if (msg.action === 'floatStop')     stopRecording();
+    if (msg.action === 'hotkeyToggle')  toggleMainRecord();
+    if (msg.action === 'hotkeyPause')   pauseResume();
     if (msg.action === 'regionSelected') {
       toast(`🔲 区域已选择: ${msg.rect.width}×${msg.rect.height}`);
     }
+
+    // ★ 新增：content.js 点击"录制小视频"触发自动录制
+    if (msg.action === 'autoStartRecord') {
+      if (!State.isRecording) {
+        const info = msg.videoInfo;
+        if (info?.width && info?.height) {
+          $('monRes').textContent = `${info.width}×${info.height}`;
+        }
+        toast('🎯 检测到视频，正在启动录制...');
+        // 自动切换到标签页录制模式
+        $('captureMode').value = 'tab';
+        startRecording();
+      }
+    }
   });
-  bgPort.onDisconnect.addListener(() => {
-    bgPort = null;
-  });
+
+  bgPort.onDisconnect.addListener(() => { bgPort = null; });
 }
 
 // ============================================================
