@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "直播内录器 Pro",
-  "version": "2.2.0",
-  "description": "网页直播视频音频内录，Offscreen闭环托管，支持硬解MP4/小窗口画中画/全Frames注入",
+  "version": "2.3.0",
+  "description": "网页直播视频音频内录，支持 360 风格悬浮栏、独立视频录制控制窗口与硬件加速",
   "permissions": [
     "activeTab",
     "storage",
@@ -10,8 +10,7 @@
     "tabCapture",
     "scripting",
     "tabs",
-    "notifications",
-    "offscreen"
+    "notifications"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -46,7 +45,7 @@
         "icons/icon16.png",
         "icons/icon48.png",
         "icons/icon128.png",
-        "offscreen.html"
+        "recorder.html"
       ],
       "matches": ["<all_urls>"]
     }
