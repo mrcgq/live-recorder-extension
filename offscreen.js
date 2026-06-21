@@ -8,6 +8,7 @@
 //   2. AudioContext Autoplay 挂起补丁（ctx.resume()）
 //   3. requestStreamId 传递精确 tabId（消除时序竞争）
 //   4. cleanupResources 切断 mediaRecorder 强引用
+//   5. 默认 H.264 编码硬件加速，彻底告别录制卡顿（Law-05）
 // ============================================================
 
 const REC = {
@@ -84,13 +85,13 @@ async function startPipeline(config) {
   }
 
   // 重置所有状态
-  REC.chunks        = [];
-  REC.totalBytes    = 0;
-  REC.seconds       = 0;
-  REC.isPaused      = false;
-  REC.prevBytes     = 0;
-  REC.prevTime      = performance.now();
-  REC.config        = config || {};
+  REC.chunks         = [];
+  REC.totalBytes     = 0;
+  REC.seconds        = 0;
+  REC.isPaused       = false;
+  REC.prevBytes      = 0;
+  REC.prevTime       = performance.now();
+  REC.config         = config || {};
   REC.currentBitrate = '0kbps';
 
   // 1. 获取 Tab Capture 流
@@ -140,7 +141,7 @@ async function startPipeline(config) {
     }
   }
 
-  // 4. 选择最佳 MIME Type
+  // 4. 选择最佳 MIME Type（默认极速 H.264 硬件加速，Law-51）
   const mimeType = pickMime(config.format);
 
   // 5. 创建 MediaRecorder
@@ -264,7 +265,7 @@ function onRecorderStop() {
 function cleanupResources() {
   // 停止所有媒体轨道
   if (REC.stream) {
-    REC.stream.getTracks().forEach((t) => t.stop());
+    REC.stream.getTracks().forEach(t => t.stop());
     REC.stream = null;
   }
 
@@ -439,18 +440,18 @@ function requestStreamId(withAudio, tabId) {
 }
 
 function pickMime(format) {
-  const candidates = (format === 'webm-h264')
+  const candidates = (format === 'mp4')
     ? [
-        'video/webm;codecs=h264,opus',
-        'video/webm;codecs=h264,pcm',
-        'video/webm;codecs=vp9,opus',
-        'video/webm',
+        'video/mp4;codecs=avc1.64001F,mp4a.40.2', // H.264 High Profile + AAC (Highly accelerated)
+        'video/mp4;codecs=avc1,mp4a.40.2',
+        'video/mp4;codecs=h264,aac',
+        'video/mp4'
       ]
     : [
-        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=h264,opus', // H.264 inside WebM container - Extremely smooth on Chrome!
         'video/webm;codecs=vp8,opus',
-        'video/webm;codecs=vp9',
-        'video/webm',
+        'video/webm;codecs=vp9,opus',
+        'video/webm'
       ];
   return candidates.find((m) => MediaRecorder.isTypeSupported(m)) || 'video/webm';
 }
