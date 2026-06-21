@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "直播内录器 Pro",
-  "version": "2.1.0",
-  "description": "网页直播视频音频内录，Offscreen闭环托管，支持超清/高清/标清/区域录制",
+  "version": "2.2.0",
+  "description": "网页直播视频音频内录，Offscreen闭环托管，支持硬解MP4/小窗口画中画/全Frames注入",
   "permissions": [
     "activeTab",
     "storage",
@@ -37,7 +37,7 @@
       "matches": ["<all_urls>"],
       "js": ["content.js"],
       "run_at": "document_idle",
-      "all_frames": false
+      "all_frames": true
     }
   ],
   "web_accessible_resources": [
