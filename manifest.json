@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "直播内录器",
-  "version": "2.0.0",
-  "description": "网页直播视频音频内录，支持超清/高清/标清，支持区域录制，支持悬浮控制条",
+  "name": "直播内录器 Pro",
+  "version": "2.1.0",
+  "description": "网页直播视频音频内录，Offscreen闭环托管，支持超清/高清/标清/区域录制",
   "permissions": [
     "activeTab",
     "storage",
@@ -10,7 +10,8 @@
     "tabCapture",
     "scripting",
     "tabs",
-    "notifications"
+    "notifications",
+    "offscreen"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -29,8 +30,7 @@
     "128": "icons/icon128.png"
   },
   "background": {
-    "service_worker": "background.js",
-    "type": "module"
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
@@ -38,6 +38,17 @@
       "js": ["content.js"],
       "run_at": "document_idle",
       "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "icons/icon16.png",
+        "icons/icon48.png",
+        "icons/icon128.png",
+        "offscreen.html"
+      ],
+      "matches": ["<all_urls>"]
     }
   ],
   "commands": {
@@ -55,15 +66,5 @@
       },
       "description": "暂停/继续录制"
     }
-  },
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "icons/icon16.png",
-        "icons/icon48.png",
-        "icons/icon128.png"
-      ],
-      "matches": ["<all_urls>"]
-    }
-  ]
+  }
 }
