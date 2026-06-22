@@ -1,13 +1,12 @@
 {
   "manifest_version": 3,
   "name": "直播内录器 Pro",
-  "version": "2.3.0",
-  "description": "网页直播视频音频内录，支持 360 风格悬浮栏、独立视频录制控制窗口与硬件加速",
+  "version": "3.0.0",
+  "description": "精准捕获网页直播视频流，仅录制纯净视频画面，支持全屏录制不卡顿",
   "permissions": [
     "activeTab",
     "storage",
     "downloads",
-    "tabCapture",
     "scripting",
     "tabs",
     "notifications"
@@ -52,17 +51,11 @@
   ],
   "commands": {
     "start-stop-recording": {
-      "suggested_key": {
-        "default": "Alt+R",
-        "mac": "Alt+R"
-      },
+      "suggested_key": { "default": "Alt+R", "mac": "Alt+R" },
       "description": "开始/停止录制"
     },
     "pause-recording": {
-      "suggested_key": {
-        "default": "Alt+P",
-        "mac": "Alt+P"
-      },
+      "suggested_key": { "default": "Alt+P", "mac": "Alt+P" },
       "description": "暂停/继续录制"
     }
   }
