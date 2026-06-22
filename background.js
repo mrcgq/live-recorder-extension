@@ -1,7 +1,10 @@
 'use strict';
 
 // ============================================================
-// Background Service Worker - 闭环路由中枢
+// Background Service Worker - 消息路由中枢
+// 职责：
+//   1. 维护独立录制窗口（录制框）生命周期
+//   2. 在网页、Popup 与录制窗口之间路由状态与控制指令
 // ============================================================
 
 let recordingState = {
@@ -14,7 +17,7 @@ let recordingState = {
   resolution  : '-',
   timeString  : '00:00:00',
   activeTabId : null,
-  recorderWindowId: null // 独立录制窗口的 ID
+  recorderWindowId: null
 };
 
 let popupPort = null;
@@ -38,7 +41,6 @@ chrome.runtime.onConnect.addListener((port) => {
 // 创建独立视频录制小窗（录制框） (对齐 Image 2)
 async function ensureRecorderWindow(config, tabId) {
   if (recordingState.recorderWindowId) {
-    // 如果窗口已存在，直接带到前台
     try {
       await chrome.windows.update(recordingState.recorderWindowId, { focused: true });
       return;
@@ -47,7 +49,6 @@ async function ensureRecorderWindow(config, tabId) {
     }
   }
 
-  // 拼接配置参数，在独立窗口中初始化
   const queryParams = new URLSearchParams({
     tabId: tabId || '',
     config: JSON.stringify(config)
