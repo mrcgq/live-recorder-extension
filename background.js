@@ -26,7 +26,7 @@ let recordingState = {
 let popupPort = null;
 let activeContentPort = null;
 let activeRecorderPort = null;
-let startupBuffer = []; // 启动缓冲池：暂存小窗打开前的数据片 [永恒一]
+let startupBuffer = []; // 启动缓冲池：暂存小窗打开前的数据片
 
 // 跨进程 Port 通道桥接器
 chrome.runtime.onConnect.addListener((port) => {
@@ -215,6 +215,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return;
   }
 
+  // 统一托管下载，严格闭环释放物理内存与本地磁盘缓存（Law-39）
   if (req.action === 'triggerDownload') {
     const safeName = sanitizeFilename(req.filename);
     chrome.downloads.download({
@@ -235,7 +236,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         const st = delta.state && delta.state.current;
         if (st === 'complete' || st === 'interrupted') {
           chrome.downloads.onChanged.removeListener(onChanged);
-          // 物理内存释放信号下发
+          // 广播释放消息至小窗，强制执行内存 URL 吊销与 OPFS 临时磁盘缓存完全擦除
           chrome.runtime.sendMessage(
             { _target: 'recorder', action: 'releaseBlobUrl', url: req.url }
           ).catch(() => {});
