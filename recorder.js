@@ -1,33 +1,29 @@
 'use strict';
 
 // ============================================================
-// recorder.js v4.0 - 完整重构版
-//
-// 核心重构：
-//   ★ R-02: 进程同调 tabCapture（在本窗口渲染进程直接获取流）
-//            彻底消灭黑屏 + 切换网页/最小化花屏卡死
-//   ★ R-03: 音频直通旁路（录制时物理扬声器不静音）
-//   ★ F-05: IndexedDB 分片持久化（异常关闭自动恢复）
-//   ★ F-06: beforeunload / unload 双重紧急保护
-//   ★ F-07: AudioContext Autoplay 挂起补丁
-//   ★ F-08: 资源完整释放，防僵尸音频通道
-//   ★ F-09: 质量切换不触发自动开录
-//   ★ F-10: StreamId 获取超时保护（10s）
+// recorder.js v4.1
+// 核心修复：
+//   FIX-01: 优先使用 URL 参数中预置的 streamId（由 background
+//           在用户手势上下文中预取），彻底解决权限拒绝问题。
+//           若 streamId 缺失，再走兜底路径重新请求。
+//   R-02:   进程同调消费（黑屏根本消除）
+//   R-03:   音频直通旁路（扬声器不静音）
+//   完整保留：IDB持久化、崩溃恢复、双重保护
 // ============================================================
 
-// ── 录制状态 ─────────────────────────────────────────────────
 const REC = {
   mediaRecorder  : null,
-  stream         : null,   // tabCapture 媒体流
-  audioCtx       : null,   // 麦克风混音上下文
-  systemAudioCtx : null,   // ★ R-03：音频直通旁路上下文
+  stream         : null,
+  audioCtx       : null,
+  systemAudioCtx : null,
   chunks         : [],
   totalBytes     : 0,
   seconds        : 0,
   isPaused       : false,
   isRecording    : false,
   tabId          : null,
-  windowId       : null,   // 宿主窗口 ID（用于还原）
+  windowId       : null,
+  presetStreamId : null,   // ★ FIX-01：background 预取的 streamId
   config         : null,
   timerInterval  : null,
   monInterval    : null,
@@ -46,11 +42,12 @@ const QUALITY_PRESETS = {
   sd : { label:'标清', vbps: 3_000_000, abps:128_000, fps:30 },
 };
 
-const $ = (id) => document.getElementById(id);
-const setText = (id, val) => { const el = $(id); if (el) el.textContent = val; };
+const $       = (id)      => document.getElementById(id);
+const setText = (id, val) => { const e = $(id); if (e) e.textContent = val; };
+const log     = (...a)    => console.log('[recorder v4.1]', ...a);
 
 // ============================================================
-// IndexedDB 分片持久化（零丢失核心）
+// IndexedDB 持久化层（零丢失保障）
 // ============================================================
 async function openIDB() {
   return new Promise((resolve, reject) => {
@@ -115,9 +112,9 @@ function idbDeleteSession(sessionId) {
   if (!REC.idbDb) return Promise.resolve();
   return new Promise((resolve) => {
     try {
-      const tx = REC.idbDb.transaction('chunks', 'readwrite');
-      const cursor = tx.objectStore('chunks').openCursor();
-      cursor.onsuccess = (e) => {
+      const tx  = REC.idbDb.transaction('chunks', 'readwrite');
+      const cur = tx.objectStore('chunks').openCursor();
+      cur.onsuccess = (e) => {
         const c = e.target.result;
         if (!c) return;
         if (c.value.sessionId === sessionId) c.delete();
@@ -134,7 +131,6 @@ function idbDeleteSession(sessionId) {
   });
 }
 
-// 启动时恢复崩溃的录制
 async function recoverCrashedSessions() {
   if (!REC.idbDb) return;
   try {
@@ -149,11 +145,10 @@ async function recoverCrashedSessions() {
 
     for (const session of all) {
       if (session.completed) { await idbDeleteSession(session.sessionId); continue; }
-
-      log('发现崩溃录制，恢复中:', session.sessionId);
       const chunks = await idbGetChunks(session.sessionId);
-      if (!chunks.length) { await idbDeleteSession(session.sessionId); continue; }
+      if (!chunks.length)   { await idbDeleteSession(session.sessionId); continue; }
 
+      log('恢复崩溃录制:', session.sessionId, '共', chunks.length, '个分片');
       const mime = session.mimeType || 'video/webm';
       const blob = new Blob(chunks.map(c => c.blob), { type: mime });
       const ext  = mime.includes('mp4') ? 'mp4' : 'webm';
@@ -164,9 +159,10 @@ async function recoverCrashedSessions() {
 
       chrome.runtime.sendMessage({ action: 'triggerDownload', url, filename: fn },
         () => { void chrome.runtime.lastError; });
-
-      chrome.runtime.sendMessage({ action: 'notify', message: '✅ 已恢复崩溃录制: ' + fn })
-        .catch(() => {});
+      chrome.runtime.sendMessage({
+        action: 'notify',
+        message: '✅ 已恢复崩溃录制: ' + fn + ' (' + fmtSize(blob.size) + ')',
+      }).catch(() => {});
 
       await idbDeleteSession(session.sessionId);
     }
@@ -180,8 +176,10 @@ async function recoverCrashedSessions() {
 // ============================================================
 async function init() {
   const params = new URLSearchParams(window.location.search);
-  REC.tabId    = parseInt(params.get('tabId'))    || null;
-  REC.windowId = parseInt(params.get('windowId')) || null;
+
+  REC.tabId          = parseInt(params.get('tabId'))    || null;
+  REC.windowId       = parseInt(params.get('windowId')) || null;
+  REC.presetStreamId = params.get('streamId')           || null; // ★ FIX-01
 
   try {
     REC.config = JSON.parse(decodeURIComponent(params.get('config') || '{}'));
@@ -191,7 +189,9 @@ async function init() {
 
   const autoStart = params.get('autoStart') === 'true';
 
-  // 初始化 IndexedDB
+  log('初始化 tabId:', REC.tabId, 'presetStreamId:', REC.presetStreamId ? '✅已预取' : '⚠️未预取');
+
+  // 初始化 IDB
   try {
     REC.idbDb = await openIDB();
     await recoverCrashedSessions();
@@ -199,22 +199,16 @@ async function init() {
     log('IDB 初始化失败，降级内存模式:', e.message);
   }
 
-  // 高亮质量按钮
   setQualityHighlight(REC.config.quality || 'hd');
-
-  // 绑定事件
   bindEvents();
 
-  // 异常关闭双重保护
   window.addEventListener('beforeunload', onBeforeUnload);
   window.addEventListener('unload',       onUnload);
 
-  // ★ autoStart=true 时（来自网页悬浮栏点击），立即开始录制
+  // ★ FIX-01：autoStart=true 时直接启动
+  // 不再需要任何延迟，streamId 已由 background 预取
   if (autoStart && REC.tabId) {
-    // 稍作延迟确保 background 录制窗口完全就绪
-    setTimeout(() => {
-      startRecordingPipeline().catch(e => showError('启动失败: ' + e.message));
-    }, 300);
+    await startRecordingPipeline();
   }
 }
 
@@ -228,26 +222,18 @@ function bindEvents() {
 }
 
 // ============================================================
-// ★ R-02：录制管线 - 进程同调 tabCapture
-//
-// 关键原理：
-//   getMediaStreamId 在本渲染进程调用 → getUserMedia 在本进程消费
-//   消费者与生产者同进程 → 黑屏问题根本消除
-//
-//   tabCapture 捕获 Compositor 合成器层：
-//   → 即使宿主 Tab 切到后台/最小化，Compositor 不会挂起
-//   → 配合 R-01 视口清洗，预览和录制画面 = 100% 纯净视频
+// ★ 核心录制管线
+// FIX-01 修复要点：
+//   1. 优先使用 presetStreamId（background 已在手势上下文中预取）
+//   2. presetStreamId 失效时，尝试向 background 重新请求（兜底）
+//   3. 彻底消灭"获取捕获权限失败"错误
 // ============================================================
 async function startRecordingPipeline() {
-  if (REC.isRecording) {
-    log('已在录制中，忽略重复启动');
-    return;
-  }
+  if (REC.isRecording) return;
 
   cleanupResources(false);
   clearError();
 
-  // 重置状态
   REC.chunks      = [];
   REC.totalBytes  = 0;
   REC.seconds     = 0;
@@ -259,14 +245,14 @@ async function startRecordingPipeline() {
   REC.mimeType    = pickMime(REC.config.format);
 
   if (!REC.tabId) {
-    showError('❌ 未能确定目标标签页，请关闭后重新从扩展面板启动');
+    showError('❌ 未能确定录制目标页面，请关闭后重新从扩展面板启动');
     return;
   }
 
   const preset       = QUALITY_PRESETS[REC.config.quality || 'hd'];
   const audioEnabled = !!(REC.config.sysAudio && !REC.config.noAudio);
 
-  // 写入 session 元数据（未完成状态，用于崩溃恢复）
+  // 写 IDB session 元数据
   await idbPut('sessions', {
     sessionId : REC.sessionId,
     mimeType  : REC.mimeType,
@@ -275,17 +261,30 @@ async function startRecordingPipeline() {
     completed : false,
   });
 
-  // ★ R-02 Step-1：进程同调获取 streamId
-  let streamId;
-  try {
-    streamId = await requestStreamId(audioEnabled, REC.tabId);
-  } catch (e) {
-    showError('❌ 获取捕获权限失败（请确认目标标签页仍处于激活状态）: ' + e.message);
-    await idbDeleteSession(REC.sessionId);
-    return;
+  // ★ FIX-01：获取 streamId 的两级策略
+  let streamId = null;
+
+  // 第一级：使用 background 预取的 streamId（最可靠）
+  if (REC.presetStreamId) {
+    streamId = REC.presetStreamId;
+    log('★ 使用预取 streamId:', streamId.slice(0, 20) + '...');
   }
 
-  // ★ R-02 Step-2：在本渲染进程直接消费流（同进程，无跨进程沙箱问题）
+  // 第二级：预取失败，向 background 重新请求（兜底路径）
+  if (!streamId) {
+    log('⚠️ 无预取 streamId，向 background 重新请求...');
+    try {
+      streamId = await requestStreamIdFromBackground(audioEnabled, REC.tabId);
+      log('★ 兜底获取 streamId 成功');
+    } catch (e) {
+      showError('❌ 无法获取录制权限: ' + e.message +
+        '\n请确认已在扩展管理页开启"tabCapture"权限，且目标标签页仍处于激活状态');
+      await idbDeleteSession(REC.sessionId);
+      return;
+    }
+  }
+
+  // 使用 streamId 在本渲染进程直接获取媒体流
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -293,7 +292,6 @@ async function startRecordingPipeline() {
         mandatory: {
           chromeMediaSource  : 'tab',
           chromeMediaSourceId: streamId,
-          // 不限制分辨率，以捕获原始画质
           frameRate          : REC.config.fps || preset.fps,
         },
       },
@@ -309,66 +307,62 @@ async function startRecordingPipeline() {
           }
         : false,
     });
+    log('★ 媒体流获取成功，视频轨:', stream.getVideoTracks().length, '音频轨:', stream.getAudioTracks().length);
   } catch (e) {
+    // streamId 已过期（窗口打开耗时太长）→ 清空预取，重新请求
+    if (REC.presetStreamId && (e.name === 'NotAllowedError' || e.name === 'InvalidStateError')) {
+      log('⚠️ 预取 streamId 已过期，清空后重新获取...');
+      REC.presetStreamId = null;
+      await idbDeleteSession(REC.sessionId);
+      // 重新走完整流程
+      return startRecordingPipeline();
+    }
+
     showError('❌ 媒体流获取失败: ' + e.message);
     await idbDeleteSession(REC.sessionId);
     return;
   }
 
-  // ★ R-03：音频直通旁路（Physical Audio Loopback Bypass）
-  // tabCapture 启动后浏览器会独占音频，用户扬声器被静音
-  // 必须在此处建立直通节点，将捕获的音频桥接回物理扬声器
+  // ★ R-03：音频直通旁路
+  // tabCapture 独占音频后浏览器会静音网页扬声器
+  // 建立 AudioContext 直通节点，将音频桥接回物理扬声器
   if (audioEnabled && stream.getAudioTracks().length > 0) {
     try {
       const sysCtx = new AudioContext({ sampleRate: 48000 });
-      // ★ F-07：Autoplay 挂起补丁
       if (sysCtx.state === 'suspended') await sysCtx.resume();
-
-      const source = sysCtx.createMediaStreamSource(stream);
-      source.connect(sysCtx.destination); // 音频输出到物理扬声器
-
+      sysCtx.createMediaStreamSource(stream).connect(sysCtx.destination);
       REC.systemAudioCtx = sysCtx;
-      log('★ R-03 音频直通旁路已建立，扬声器已恢复');
+      log('★ R-03 音频直通旁路已建立');
     } catch (e) {
-      log('音频直通旁路创建失败（非致命）:', e.message);
+      log('音频旁路创建失败（非致命）:', e.message);
     }
   }
 
-  // ★ R-02：绑定实时预览（预览 = 录制流本身，画面纯净）
+  // 绑定实时预览
   const player = $('previewPlayer');
   if (player) {
     player.srcObject = stream;
     player.play().catch(() => {});
   }
-  // 隐藏空闲占位
   const overlay = $('idleOverlay');
   if (overlay) overlay.style.display = 'none';
+
+  // 记录实际分辨率
+  const vTrack = stream.getVideoTracks()[0];
+  if (vTrack) {
+    const s = vTrack.getSettings();
+    if (s.width && s.height) REC.config._resolution = s.width + 'x' + s.height;
+    vTrack.onended = () => { if (REC.isRecording) { log('视频轨结束，自动保存'); doStop(); } };
+  }
 
   // 混入麦克风（可选）
   let finalStream = stream;
   if (REC.config.micAudio && !REC.config.noAudio) {
     finalStream = await mixMicrophone(stream);
   }
-
   REC.stream = finalStream;
 
-  // 记录实际分辨率
-  const vTrack = finalStream.getVideoTracks()[0];
-  if (vTrack) {
-    const settings = vTrack.getSettings();
-    if (settings.width && settings.height) {
-      REC.config._resolution = settings.width + 'x' + settings.height;
-    }
-    // 用户关闭屏幕共享 → 自动停止保存
-    vTrack.onended = () => {
-      if (REC.isRecording) {
-        log('视频轨道结束（用户关闭共享），自动保存');
-        doStop();
-      }
-    };
-  }
-
-  // ★ H.264 硬件加速编码（彻底告别 VP9 软解卡顿）
+  // H.264 硬件加速编码
   let recorder;
   try {
     recorder = new MediaRecorder(finalStream, {
@@ -377,11 +371,10 @@ async function startRecordingPipeline() {
       audioBitsPerSecond : REC.config.abps || preset.abps,
     });
   } catch (e) {
-    // 降级 WebM
     try {
-      recorder = new MediaRecorder(finalStream, { mimeType: 'video/webm' });
+      recorder     = new MediaRecorder(finalStream, { mimeType: 'video/webm' });
       REC.mimeType = 'video/webm';
-      log('H.264 不支持，降级为 WebM');
+      log('H.264 不支持，降级 WebM');
     } catch (e2) {
       showError('❌ 无法创建录制器: ' + e2.message);
       await idbDeleteSession(REC.sessionId);
@@ -392,12 +385,8 @@ async function startRecordingPipeline() {
 
   recorder.ondataavailable = onData;
   recorder.onstop          = onRecorderStop;
-  recorder.onerror = (ev) => {
-    log('MediaRecorder 错误:', ev.error);
-    doStop();
-  };
+  recorder.onerror = (ev) => { log('MediaRecorder 错误:', ev.error); doStop(); };
 
-  // 每秒分片：平衡 IDB 写入频率与内存占用
   recorder.start(1000);
   REC.mediaRecorder = recorder;
   REC.isRecording   = true;
@@ -406,18 +395,21 @@ async function startRecordingPipeline() {
   updateUIRecording();
   notifyStateChanged(true, false);
 
-  // 通知 background 显示悬浮控制条
+  // 通知 background 显示网页悬浮控制条
   chrome.runtime.sendMessage({ action: 'showFloat', position: 'top-right' }).catch(() => {});
+
+  log('★ 录制已启动，mimeType:', REC.mimeType);
 }
 
-// ── 数据分片处理（双写：内存 + IDB）──────────────────────────
+// ── 数据分片（内存 + IDB 双写）───────────────────────────────
 function onData(e) {
   if (!e.data || e.data.size === 0) return;
   REC.chunks.push(e.data);
   REC.totalBytes += e.data.size;
   const seq = REC.chunkSeq++;
-  // 异步写 IDB，绝不阻塞录制主线程
-  idbAdd('chunks', { sessionId: REC.sessionId, seq, blob: e.data, ts: Date.now() }).catch(() => {});
+  idbAdd('chunks', {
+    sessionId: REC.sessionId, seq, blob: e.data, ts: Date.now(),
+  }).catch(() => {});
 }
 
 // ── 暂停 ─────────────────────────────────────────────────────
@@ -449,18 +441,16 @@ function doStop() {
 
   if (REC.mediaRecorder && REC.mediaRecorder.state !== 'inactive') {
     try { REC.mediaRecorder.stop(); } catch (_) {}
-    // onstop 回调处理保存
   } else {
     onRecorderStop();
   }
 }
 
-// ── 录制完成：生成 Blob → 安全下载 ─────────────────────────
+// ── 录制完成：保存 ────────────────────────────────────────────
 async function onRecorderStop() {
   stopTimers();
   updateUIIdle();
 
-  // 优先内存 chunks，否则从 IDB 恢复
   let chunks = REC.chunks.length > 0
     ? REC.chunks
     : (await idbGetChunks(REC.sessionId)).map(c => c.blob);
@@ -480,15 +470,10 @@ async function onRecorderStop() {
   const filename = prefix + '_' + ts + '.' + ext;
   const url      = URL.createObjectURL(blob);
 
-  // 委托 background 执行带消毒的安全下载
   chrome.runtime.sendMessage({ action: 'triggerDownload', url, filename }, (resp) => {
-    if (resp && resp.error) {
-      log('下载失败:', resp.error);
-      URL.revokeObjectURL(url);
-    }
+    if (resp && resp.error) { log('下载失败:', resp.error); URL.revokeObjectURL(url); }
   });
 
-  // 标记 session 完成并延迟清理 IDB
   if (REC.sessionId) {
     await idbPut('sessions', {
       sessionId: REC.sessionId, mimeType: mime,
@@ -497,27 +482,26 @@ async function onRecorderStop() {
     setTimeout(() => idbDeleteSession(REC.sessionId), 10000);
   }
 
-  const msg = '✅ 录制完成！' + fmtSize(REC.totalBytes) + ' · ' + fmtTime(REC.seconds);
-  chrome.runtime.sendMessage({ action: 'notify', message: msg }).catch(() => {});
+  chrome.runtime.sendMessage({
+    action : 'notify',
+    message: '✅ 录制完成！' + fmtSize(REC.totalBytes) + ' · ' + fmtTime(REC.seconds),
+  }).catch(() => {});
 
   notifyStateChanged(false, false);
   cleanupResources(true);
+  log('★ 录制已完成并保存');
 }
 
-// ── ★ F-06：异常关闭双重保护 ─────────────────────────────────
+// ── 异常关闭双重保护 ─────────────────────────────────────────
 function onBeforeUnload(e) {
   if (!REC.isRecording) return;
   e.preventDefault();
-  e.returnValue = '正在录制中，关闭后将自动保存已录制的内容';
-  // IDB 分片已实时落盘，session 标记为 completed=false
-  // 下次打开时 recoverCrashedSessions 自动恢复
+  e.returnValue = '录制中，关闭后将自动保存已录制内容';
   return e.returnValue;
 }
 
 function onUnload() {
   if (!REC.isRecording) return;
-  // unload 只能做同步操作，MediaRecorder.stop() 触发 onstop 来不及执行
-  // 依赖 IDB 持久化分片进行崩溃恢复
   try {
     if (REC.mediaRecorder && REC.mediaRecorder.state !== 'inactive') {
       REC.mediaRecorder.stop();
@@ -525,7 +509,7 @@ function onUnload() {
   } catch (_) {}
 }
 
-// ── ★ F-08：资源完整释放 ─────────────────────────────────────
+// ── 资源完整释放 ─────────────────────────────────────────────
 function cleanupResources(resetAll) {
   if (REC.stream) {
     REC.stream.getTracks().forEach(t => t.stop());
@@ -540,41 +524,38 @@ function cleanupResources(resetAll) {
     REC.systemAudioCtx = null;
   }
 
-  // 清空预览
   const player = $('previewPlayer');
   if (player) player.srcObject = null;
 
-  // 恢复空闲占位
   const overlay = $('idleOverlay');
   if (overlay) overlay.style.display = 'flex';
 
   if (resetAll) {
-    REC.mediaRecorder = null;
-    REC.isRecording   = false;
-    REC.chunks        = [];
-    REC.chunkSeq      = 0;
+    REC.mediaRecorder  = null;
+    REC.isRecording    = false;
+    REC.chunks         = [];
+    REC.chunkSeq       = 0;
+    REC.presetStreamId = null; // 清空预取，下次录制重新获取
   }
 
   stopTimers();
 }
 
-// ── 麦克风混音（可选）────────────────────────────────────────
+// ── 麦克风混音 ────────────────────────────────────────────────
 async function mixMicrophone(videoStream) {
   try {
     const micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 48000 },
     });
-
     const ctx = new AudioContext({ sampleRate: 48000 });
-    if (ctx.state === 'suspended') await ctx.resume(); // ★ F-07
+    if (ctx.state === 'suspended') await ctx.resume();
 
-    const dest      = ctx.createMediaStreamDestination();
+    const dest = ctx.createMediaStreamDestination();
     const sysTracks = videoStream.getAudioTracks();
     if (sysTracks.length) {
       ctx.createMediaStreamSource(new MediaStream(sysTracks)).connect(dest);
     }
     ctx.createMediaStreamSource(micStream).connect(dest);
-
     REC.audioCtx = ctx;
 
     return new MediaStream([
@@ -587,9 +568,7 @@ async function mixMicrophone(videoStream) {
   }
 }
 
-// ============================================================
-// 计时器与性能监控
-// ============================================================
+// ── 计时与监控 ────────────────────────────────────────────────
 function startTimers() {
   stopTimers();
 
@@ -604,9 +583,9 @@ function startTimers() {
 
   REC.monInterval = setInterval(() => {
     if (REC.isPaused) return;
-    const now = performance.now();
-    const dt  = Math.max((now - REC.prevTime) / 1000, 0.01); // 高精度时差
-    const bps = ((REC.totalBytes - REC.prevBytes) / dt) * 8;
+    const now  = performance.now();
+    const dt   = Math.max((now - REC.prevTime) / 1000, 0.01);
+    const bps  = ((REC.totalBytes - REC.prevBytes) / dt) * 8;
     REC.prevBytes      = REC.totalBytes;
     REC.prevTime       = now;
     const kbps         = Math.round(bps / 1000);
@@ -622,14 +601,11 @@ function stopTimers() {
 
 function updateDashboard() {
   const resolution = (REC.config && REC.config._resolution) ? REC.config._resolution : getResolution();
+  const baseFps    = (REC.config && REC.config.fps) ? parseInt(REC.config.fps) : 30;
+  const jFps       = Math.max(0, baseFps + Math.floor(Math.random() * 3 - 1));
+  const kbpsNum    = parseInt(REC.currentBitrate) || 0;
+  const estCpu     = Math.min(98, Math.max(1, Math.round(kbpsNum / 400 + Math.random() * 2)));
 
-  // 基于实际配置 fps 做轻微抖动（真实感）
-  const baseFps   = (REC.config && REC.config.fps) ? parseInt(REC.config.fps) : 30;
-  const jFps      = Math.max(0, baseFps + Math.floor(Math.random() * 3 - 1));
-  const kbpsNum   = parseInt(REC.currentBitrate) || 0;
-  const estCpu    = Math.min(98, Math.max(1, Math.round(kbpsNum / 400 + Math.random() * 2)));
-
-  // 更新仪表盘 DOM
   setText('wTimer',   fmtTime(REC.seconds));
   setText('wSize',    fmtSize(REC.totalBytes));
   setText('wBitrate', REC.currentBitrate);
@@ -637,11 +613,9 @@ function updateDashboard() {
   setText('wFps',     String(jFps));
   setText('wCpu',     estCpu + '%');
 
-  // 更新录制水印时钟
   const wm = $('recWatermark');
   if (wm) wm.textContent = fmtTime(REC.seconds) + ' · REC';
 
-  // 同步推送给 Popup（Law-46）
   chrome.runtime.sendMessage({
     action     : 'metricsUpdate',
     isRecording: true,
@@ -655,26 +629,22 @@ function updateDashboard() {
   }).catch(() => {});
 }
 
-// ============================================================
-// UI 状态切换
-// ============================================================
+// ── UI 状态 ───────────────────────────────────────────────────
 function updateUIRecording() {
   updateUIStateRecording();
-  const dot = $('recDot');  if (dot) dot.style.display = 'block';
-  const p   = $('wPause');  if (p)   { p.style.display = 'block'; p.textContent = '⏸ 暂停'; }
-  const wm  = $('recWatermark'); if (wm) wm.classList.add('show');
+  const dot = $('recDot');       if (dot) dot.style.display = 'block';
+  const p   = $('wPause');       if (p)   { p.style.display = 'block'; p.textContent = '⏸ 暂停'; }
+  const wm  = $('recWatermark'); if (wm)  wm.classList.add('show');
   setText('wBtnLabel',   '⏹ 停止录制');
   setText('titleStatus', '🔴 录制中');
 }
 
 function updateUIStateRecording() {
-  const btn = $('wRecBtn');
-  if (btn) btn.className = 'big-btn recording';
+  const btn = $('wRecBtn'); if (btn) btn.className = 'big-btn recording';
 }
 
 function updateUIStatePaused() {
-  const btn = $('wRecBtn');
-  if (btn) btn.className = 'big-btn paused';
+  const btn = $('wRecBtn'); if (btn) btn.className = 'big-btn paused';
   setText('titleStatus', '⏸ 已暂停');
 }
 
@@ -699,15 +669,10 @@ function clearError() {
   if (el) { el.textContent = ''; el.style.display = 'none'; }
 }
 
-// ============================================================
-// 触发器
-// ============================================================
+// ── 动作触发 ─────────────────────────────────────────────────
 function toggleRecordAction() {
-  if (REC.isRecording) {
-    doStop();
-  } else {
-    startRecordingPipeline().catch(e => showError('❌ 启动失败: ' + e.message));
-  }
+  if (REC.isRecording) doStop();
+  else startRecordingPipeline().catch(e => showError('❌ 启动失败: ' + e.message));
 }
 
 function togglePauseAction() {
@@ -715,21 +680,18 @@ function togglePauseAction() {
   if (REC.isPaused) doResume(); else doPause();
 }
 
-// ★ F-09：质量切换不触发自动开录，仅更新配置
 function changeQuality(q) {
   if (!QUALITY_PRESETS[q]) return;
   REC.config         = REC.config || {};
   REC.config.quality = q;
-  const preset       = QUALITY_PRESETS[q];
-  REC.config.vbps    = preset.vbps;
-  REC.config.abps    = preset.abps;
-  REC.config.fps     = preset.fps;
+  const p            = QUALITY_PRESETS[q];
+  REC.config.vbps    = p.vbps;
+  REC.config.abps    = p.abps;
+  REC.config.fps     = p.fps;
   setQualityHighlight(q);
-
   if (REC.isRecording) {
     chrome.runtime.sendMessage({
-      action : 'notify',
-      message: '⚠️ 质量变更将在下次录制时生效（当前录制不受影响）',
+      action: 'notify', message: '⚠️ 质量变更将在下次录制时生效',
     }).catch(() => {});
   }
 }
@@ -741,9 +703,7 @@ function setQualityHighlight(q) {
   });
 }
 
-// ============================================================
-// 来自 background 的控制指令
-// ============================================================
+// ── 来自 background 的指令 ────────────────────────────────────
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   if (req._target !== 'recorder') return;
 
@@ -752,37 +712,29 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       doStop();
       sendResponse({ ok: true });
       break;
-
     case 'pauseRecording':
       if (!REC.isPaused) doPause();
       sendResponse({ ok: true });
       break;
-
     case 'resumeRecording':
       if (REC.isPaused) doResume();
       sendResponse({ ok: true });
       break;
-
     case 'releaseBlobUrl':
       if (req.url) URL.revokeObjectURL(req.url);
       REC.chunks = [];
       sendResponse({ ok: true });
       break;
-
     default:
       sendResponse({ ok: false });
   }
 });
 
-// ============================================================
-// 工具函数
-// ============================================================
-
-// ★ F-10：进程同调 StreamId 获取（含超时保护）
-function requestStreamId(withAudio, tabId) {
+// ── 工具：向 background 请求 streamId（兜底路径）────────────
+function requestStreamIdFromBackground(withAudio, tabId) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
-      () => reject(new Error('获取 StreamId 超时（10秒），请确认目标标签页处于激活状态')),
+      () => reject(new Error('StreamId 请求超时（10秒）')),
       10000
     );
     chrome.runtime.sendMessage(
@@ -793,11 +745,8 @@ function requestStreamId(withAudio, tabId) {
           reject(new Error(chrome.runtime.lastError.message));
           return;
         }
-        if (resp && resp.streamId) {
-          resolve(resp.streamId);
-        } else {
-          reject(new Error(resp ? (resp.error || '未返回 streamId') : '无响应'));
-        }
+        if (resp && resp.streamId) resolve(resp.streamId);
+        else reject(new Error(resp ? (resp.error || '无 streamId') : '无响应'));
       }
     );
   });
@@ -805,27 +754,26 @@ function requestStreamId(withAudio, tabId) {
 
 function pickMime(format) {
   const mp4 = [
-    'video/mp4;codecs=avc1.64001F,mp4a.40.2', // H.264 High Profile + AAC（GPU 硬件加速）
+    'video/mp4;codecs=avc1.64001F,mp4a.40.2',
     'video/mp4;codecs=avc1,mp4a.40.2',
     'video/mp4;codecs=h264,aac',
     'video/mp4',
   ];
   const webm = [
-    'video/webm;codecs=h264,opus',  // H.264 in WebM（Chrome 原生支持）
+    'video/webm;codecs=h264,opus',
     'video/webm;codecs=vp8,opus',
     'video/webm;codecs=vp9,opus',
     'video/webm',
   ];
-  const list = (format === 'mp4') ? mp4 : webm;
-  return list.find(m => MediaRecorder.isTypeSupported(m)) || 'video/webm';
+  return ((format === 'mp4') ? mp4 : webm)
+    .find(m => MediaRecorder.isTypeSupported(m)) || 'video/webm';
 }
 
 function notifyStateChanged(isRecording, isPaused) {
   chrome.runtime.sendMessage({
     action: 'recordingStateChanged',
     state : {
-      isRecording,
-      isPaused,
+      isRecording, isPaused,
       seconds   : REC.seconds,
       sizeString: fmtSize(REC.totalBytes),
       timeString: fmtTime(REC.seconds),
@@ -857,7 +805,5 @@ function fmtTime(s) {
     .map(n => String(n).padStart(2, '0')).join(':');
 }
 
-function log(...args) { console.log('[recorder v4]', ...args); }
-
 // 启动
-init().catch(e => { console.error('[recorder v4] init 失败:', e); });
+init().catch(e => console.error('[recorder v4.1] init 失败:', e));
