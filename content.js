@@ -1,23 +1,57 @@
 'use strict';
 
 // ============================================================
-// content.js v4.2 - DOM 树隔离、握手自重连与动态尺寸上报
+// content.js v3.1 - 深度穿透视频捕获引擎
+//
+// 核心架构职责：
+//   1. 深度穿透 Shadow DOM 精准识别直播 <video> 元素
+//   2. 直接调用 video.captureStream() 抽取纯净视频流
+//   3. 通过 MediaRecorder 在页面内完成录制编码
+//   4. 结合 background.js & recorder.js 的 tabCapture 保活，
+//      彻底解决了“切页/后台/最小化”产生的花屏、视频流断帧和卡顿！
+//   5. 拥有容灾备份：若视频源受强跨域安全策略 (CORS) 保护报错，
+//      会自动无缝唤醒 recorder 进程的 tabCapture 备份管线录制，双保险。
 // ============================================================
 
+// ── 录制状态（页面内核心数据面）────────────────────────────
+const REC = {
+  mediaRecorder  : null,
+  captureStream  : null,   // video.captureStream() 返回的流
+  audioStream    : null,   // 麦克风流
+  mixedStream    : null,   // 最终混合流
+  audioCtx       : null,
+  chunks         : [],
+  totalBytes     : 0,
+  seconds        : 0,
+  isPaused       : false,
+  isRecording    : false,
+  config         : null,
+  targetVideo    : null,   // 当前锁定的直播 video 元素
+  timerInterval  : null,
+  monInterval    : null,
+  prevBytes      : 0,
+  prevTime       : 0,
+  currentBitrate : '0kbps',
+  mimeType       : 'video/webm',
+  sessionId      : null,
+  idbDb          : null,
+  chunkSeq       : 0,
+  blobUrls       : [],     // 待回收的 Blob URL
+};
+
+// ── UI 状态 ──────────────────────────────────────────────────
 const CS = {
-  hoverVideo       : null,
-  hoverBar         : null,
-  hoverRAF         : null,
-  leaveTimer       : null,
-  floatBar         : null,
-  floatTimer       : null,
-  floatSec         : 0,
-  floatPaused      : false,
-  regionActive     : false,
-  observer         : null,
-  bindTimeout      : null,
-  sanitizedVideo   : null,   // 当前被隔离清洗的视频元素
-  isolatedElements : [],     // 用于完美回退布局的 DOM 状态备份
+  hoverVideo  : null,
+  hoverBar    : null,
+  hoverRAF    : null,
+  leaveTimer  : null,
+  floatBar    : null,
+  floatTimer  : null,
+  floatSec    : 0,
+  floatPaused : false,
+  regionActive: false,
+  observer    : null,
+  bindTimeout : null,
 };
 
 function fmtTime(s) {
@@ -26,235 +60,154 @@ function fmtTime(s) {
     .map(n => String(n).padStart(2, '0')).join(':');
 }
 
-// ============================================================
-// ★ 深度 DOM 树隔离与视口清洗（清洗多余网页内容）
-// ============================================================
-function applyViewportSanitize() {
-  const video = pickBestVideo();
-  if (!video) {
-    console.warn('[content] 视口清洗：未找到有效视频');
-    return;
-  }
-
-  if (CS.sanitizedVideo === video) {
-    reportVideoDimensions();
-    return;
-  }
-  CS.sanitizedVideo = video;
-  CS.isolatedElements = [];
-
-  // 1. 回溯收集视频元素的所有祖先节点 (深度兼容 Shadow DOM 穿透)
-  const ancestors = new Set();
-  let curr = video;
-  while (curr && curr !== document.documentElement) {
-    ancestors.add(curr);
-    if (curr.parentElement) {
-      curr = curr.parentElement;
-    } else if (curr.parentNode) {
-      if (curr.parentNode instanceof ShadowRoot) {
-        curr = curr.parentNode.host;
-      } else {
-        curr = curr.parentNode;
-      }
-    } else {
-      curr = null;
-    }
-  }
-  ancestors.add(document.documentElement);
-  ancestors.add(document.body);
-
-  // 2. 递归隐藏所有非视频祖先节点的元素
-  function isolateNode(node) {
-    if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
-    const tag = node.tagName;
-    if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK') return;
-
-    if (!ancestors.has(node)) {
-      const origDisplay = node.style.getPropertyValue('display');
-      const origImportance = node.style.getPropertyPriority('display');
-
-      CS.isolatedElements.push({
-        el: node,
-        type: 'hide',
-        origDisplay: origDisplay || '',
-        origImportance: origImportance || ''
-      });
-
-      node.style.setProperty('display', 'none', 'important');
-      return; 
-    }
-
-    if (node.children) {
-      Array.from(node.children).forEach(child => isolateNode(child));
-    }
-
-    if (node.shadowRoot && node.shadowRoot.children) {
-      Array.from(node.shadowRoot.children).forEach(child => isolateNode(child));
-    }
-  }
-
-  isolateNode(document.body);
-
-  // 3. 隐藏视频容器内除了 video 本身以外的同级节点 (清理多余的控制条、播放按钮、浮层等)
-  if (video.parentElement) {
-    Array.from(video.parentElement.children).forEach((sibling) => {
-      if (sibling !== video && sibling.tagName !== 'SCRIPT' && sibling.tagName !== 'STYLE' && sibling.tagName !== 'LINK') {
-        const origDisplay = sibling.style.getPropertyValue('display');
-        const origImportance = sibling.style.getPropertyPriority('display');
-
-        CS.isolatedElements.push({
-          el: sibling,
-          type: 'hide',
-          origDisplay: origDisplay || '',
-          origImportance: origImportance || ''
-        });
-        sibling.style.setProperty('display', 'none', 'important');
-      }
-    });
-  }
-
-  // 4. 清洗并重置所有祖先容器盒模型，移除限制
-  ancestors.forEach((el) => {
-    if (el === document.documentElement || el === document.body) {
-      CS.isolatedElements.push({
-        el: el,
-        type: 'root',
-        origStyle: el.getAttribute('style') || ''
-      });
-      el.style.setProperty('background', '#000', 'important');
-      el.style.setProperty('overflow', 'hidden', 'important');
-      el.style.setProperty('margin', '0', 'important');
-      el.style.setProperty('padding', '0', 'important');
-      el.style.setProperty('width', '100vw', 'important');
-      el.style.setProperty('height', '100vh', 'important');
-      return;
-    }
-
-    CS.isolatedElements.push({
-      el: el,
-      type: 'ancestor',
-      origStyle: el.getAttribute('style') || ''
-    });
-
-    el.style.setProperty('position', 'static', 'important');
-    el.style.setProperty('margin', '0', 'important');
-    el.style.setProperty('padding', '0', 'important');
-    el.style.setProperty('width', '100%', 'important');
-    el.style.setProperty('height', '100%', 'important');
-    el.style.setProperty('max-width', 'none', 'important');
-    el.style.setProperty('max-height', 'none', 'important');
-    el.style.setProperty('transform', 'none', 'important');
-    el.style.setProperty('filter', 'none', 'important');
-    el.style.setProperty('perspective', 'none', 'important');
-    el.style.setProperty('overflow', 'visible', 'important');
-    el.style.setProperty('clip', 'auto', 'important');
-    el.style.setProperty('contain', 'none', 'important');
-    el.style.setProperty('opacity', '1', 'important');
-  });
-
-  // 5. 强行拉伸并置顶 <video> 元素填满视口
-  CS.isolatedElements.push({
-    el: video,
-    type: 'video',
-    origStyle: video.getAttribute('style') || ''
-  });
-
-  video.style.setProperty('position', 'fixed', 'important');
-  video.style.setProperty('top', '0', 'important');
-  video.style.setProperty('left', '0', 'important');
-  video.style.setProperty('width', '100vw', 'important');
-  video.style.setProperty('height', '100vh', 'important');
-  video.style.setProperty('z-index', '2147483647', 'important');
-  video.style.setProperty('background', '#000', 'important');
-  video.style.setProperty('object-fit', 'contain', 'important');
-  video.style.setProperty('transform', 'none', 'important');
-  video.style.setProperty('margin', '0', 'important');
-  video.style.setProperty('padding', '0', 'important');
-  video.style.setProperty('border', 'none', 'important');
-  video.style.setProperty('border-radius', '0', 'important');
-  video.style.setProperty('box-shadow', 'none', 'important');
-  video.style.setProperty('opacity', '1', 'important');
-  video.style.setProperty('visibility', 'visible', 'important');
-
-  console.log('[content] ★ 深度 DOM 纯化清洗隔离已应用，视频已完美满屏');
-
-  // 主动检测视频物理分辨率并进行上报，动态调整外壳窗口尺寸
-  reportVideoDimensions();
+function fmtSize(b) {
+  b = b || 0;
+  if (b < 1024)       return b + 'B';
+  if (b < 1048576)    return (b / 1024).toFixed(1) + 'KB';
+  if (b < 1073741824) return (b / 1048576).toFixed(2) + 'MB';
+  return (b / 1073741824).toFixed(2) + 'GB';
 }
 
-// 录制结束后无损还原原本的页面布局
-function removeViewportSanitize() {
-  if (!CS.sanitizedVideo) return;
+// ============================================================
+// IndexedDB 分片持久化
+// ============================================================
+async function openIDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('LiveRecorderContentDB', 1);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('chunks')) {
+        db.createObjectStore('chunks', { keyPath: 'id', autoIncrement: true });
+      }
+      if (!db.objectStoreNames.contains('sessions')) {
+        db.createObjectStore('sessions', { keyPath: 'sessionId' });
+      }
+    };
+    req.onsuccess = (e) => resolve(e.target.result);
+    req.onerror   = (e) => reject(e.target.error);
+  });
+}
 
-  console.log('[content] ★ 开始还原网页原本的布局结构...');
-
-  for (let i = CS.isolatedElements.length - 1; i >= 0; i--) {
-    const item = CS.isolatedElements[i];
+function idbPut(storeName, data) {
+  if (!REC.idbDb) return Promise.resolve();
+  return new Promise((resolve) => {
     try {
-      if (!item.el) continue;
-
-      if (item.type === 'hide') {
-        if (item.origDisplay === '' || item.origDisplay === 'none') {
-          item.el.style.removeProperty('display');
-        } else {
-          item.el.style.setProperty('display', item.origDisplay, item.origImportance || '');
-        }
-      } else if (item.type === 'ancestor' || item.type === 'root' || item.type === 'video') {
-        if (item.origStyle === '') {
-          item.el.removeAttribute('style');
-        } else {
-          item.el.setAttribute('style', item.origStyle);
-        }
-      }
-    } catch (e) {
-      console.warn('[content] 样式节点恢复失败:', e);
-    }
-  }
-
-  CS.sanitizedVideo = null;
-  CS.isolatedElements = [];
-  console.log('[content] ★ 网页已无损复原');
-}
-
-// ============================================================
-// ★ 获取并上报视频真实像素比例
-// ============================================================
-function reportVideoDimensions() {
-  const video = CS.sanitizedVideo || pickBestVideo();
-  if (!video) return;
-
-  // 优先获取真实的视频物理流像素尺寸
-  const w = video.videoWidth || video.offsetWidth || 1280;
-  const h = video.videoHeight || video.offsetHeight || 720;
-
-  if (w > 100 && h > 100) {
-    chrome.runtime.sendMessage({
-      action: 'resizeIsolatedWindow',
-      width: w,
-      height: h
-    }, () => {
-      void chrome.runtime.lastError;
-    });
-  }
-}
-
-// ============================================================
-// ★ 握手自检机制：重新加载或迁移时自动隔离，避免逻辑中断
-// ============================================================
-function checkAndAutoIsolate() {
-  chrome.runtime.sendMessage({ action: 'checkIfIResultInRecording' }, (resp) => {
-    if (chrome.runtime.lastError) return;
-    if (resp && resp.isRecordingTarget) {
-      console.log('[content] ★ 页面重载或迁移完成，检测到处于录制目标中，重新触发清洗');
-      setTimeout(() => {
-        applyViewportSanitize();
-      }, 500);
-    }
+      const tx = REC.idbDb.transaction(storeName, 'readwrite');
+      tx.objectStore(storeName).put(data);
+      tx.oncomplete = resolve;
+      tx.onerror    = resolve;
+    } catch (_) { resolve(); }
   });
 }
 
+function idbAddChunk(data) {
+  if (!REC.idbDb) return Promise.resolve();
+  return new Promise((resolve) => {
+    try {
+      const tx = REC.idbDb.transaction('chunks', 'readwrite');
+      tx.objectStore('chunks').add(data);
+      tx.oncomplete = resolve;
+      tx.onerror    = resolve;
+    } catch (_) { resolve(); }
+  });
+}
+
+function idbGetChunks(sessionId) {
+  return new Promise((resolve) => {
+    if (!REC.idbDb) { resolve([]); return; }
+    try {
+      const results = [];
+      const cursor  = REC.idbDb.transaction('chunks', 'readonly')
+                        .objectStore('chunks').openCursor();
+      cursor.onsuccess = (e) => {
+        const c = e.target.result;
+        if (!c) { resolve(results.sort((a, b) => a.seq - b.seq)); return; }
+        if (c.value.sessionId === sessionId) results.push(c.value);
+        c.continue();
+      };
+      cursor.onerror = () => resolve(results);
+    } catch (_) { resolve([]); }
+  });
+}
+
+function idbDeleteSession(sessionId) {
+  if (!REC.idbDb) return Promise.resolve();
+  return new Promise((resolve) => {
+    try {
+      const tx = REC.idbDb.transaction('chunks', 'readwrite');
+      const cs = tx.objectStore('chunks');
+      const cur = cs.openCursor();
+      cur.onsuccess = (e) => {
+        const c = e.target.result;
+        if (!c) return;
+        if (c.value.sessionId === sessionId) c.delete();
+        c.continue();
+      };
+      tx.oncomplete = () => {
+        const tx2 = REC.idbDb.transaction('sessions', 'readwrite');
+        tx2.objectStore('sessions').delete(sessionId);
+        tx2.oncomplete = resolve;
+        tx2.onerror    = resolve;
+      };
+      tx.onerror = resolve;
+    } catch (_) { resolve(); }
+  });
+}
+
+async function recoverCrashedSessions() {
+  if (!REC.idbDb) return;
+  try {
+    const all = await new Promise((resolve) => {
+      try {
+        const req = REC.idbDb.transaction('sessions', 'readonly')
+                      .objectStore('sessions').getAll();
+        req.onsuccess = (e) => resolve(e.target.result || []);
+        req.onerror   = () => resolve([]);
+      } catch (_) { resolve([]); }
+    });
+
+    for (const session of all) {
+      if (session.completed) { await idbDeleteSession(session.sessionId); continue; }
+      const chunks = await idbGetChunks(session.sessionId);
+      if (!chunks.length) { await idbDeleteSession(session.sessionId); continue; }
+
+      const mime     = session.mimeType || 'video/webm';
+      const blob     = new Blob(chunks.map(c => c.blob), { type: mime });
+      const ext      = mime.includes('mp4') ? 'mp4' : 'webm';
+      const filename = (session.prefix || '崩溃恢复') + '_recovered_' +
+                       new Date(session.startTime || Date.now())
+                         .toISOString().replace('T','_').replace(/:/g,'-').slice(0,19) +
+                       '.' + ext;
+      const url = URL.createObjectURL(blob);
+
+      chrome.runtime.sendMessage({ action: 'triggerDownload', url, filename },
+        () => { void chrome.runtime.lastError; });
+      chrome.runtime.sendMessage({ action: 'notify', message: '✅ 已恢复录制: ' + filename })
+        .catch(() => {});
+
+      await idbDeleteSession(session.sessionId);
+    }
+  } catch (e) {
+    console.warn('[content-rec] 崩溃恢复失败:', e.message);
+  }
+}
+
 // ============================================================
-// ★ Shadow DOM 深度穿透检索
+// 初始化
+// ============================================================
+async function init() {
+  try {
+    REC.idbDb = await openIDB();
+    await recoverCrashedSessions();
+  } catch (e) {
+    console.warn('[content-rec] IDB 初始化失败，降级内存模式:', e.message);
+  }
+
+  initVideoDetection();
+}
+
+// ============================================================
+// Shadow DOM 深度穿透视频检测
 // ============================================================
 function findVideosDeep(root) {
   root = root || document;
@@ -262,16 +215,11 @@ function findVideosDeep(root) {
 
   function traverse(node) {
     if (!node) return;
-    const t = node.nodeType;
-    if (t !== Node.ELEMENT_NODE && t !== Node.DOCUMENT_FRAGMENT_NODE) return;
-
-    if (node.tagName === 'VIDEO') {
-      videos.push(node);
-    } else {
-      const ch = node.children;
-      if (ch) for (let i = 0; i < ch.length; i++) traverse(ch[i]);
-    }
-
+    const type = node.nodeType;
+    if (type !== Node.ELEMENT_NODE && type !== Node.DOCUMENT_FRAGMENT_NODE) return;
+    if (node.tagName === 'VIDEO') videos.push(node);
+    const ch = node.children;
+    if (ch) for (let i = 0; i < ch.length; i++) traverse(ch[i]);
     if (node.shadowRoot) traverse(node.shadowRoot);
   }
 
@@ -279,30 +227,31 @@ function findVideosDeep(root) {
   return videos;
 }
 
-function isValidVideo(video) {
+function isLiveVideo(video) {
   if (!video) return false;
   const rect = video.getBoundingClientRect();
   if (rect.width < 320 || rect.height < 180) return false;
   if (!video.src && !video.srcObject && !video.currentSrc) return false;
-  if (isFinite(video.duration) && video.duration > 0 && video.duration < 15) return false;
+  if (isFinite(video.duration) && video.duration > 0 && video.duration < 10) return false;
   return true;
 }
 
-function pickBestVideo() {
-  let best = null, bestArea = 0;
-  for (const v of findVideosDeep()) {
-    if (!isValidVideo(v)) continue;
-    const r    = v.getBoundingClientRect();
-    const area = r.width * r.height;
+function pickBestLiveVideo() {
+  const videos = findVideosDeep();
+  let best = null;
+  let bestArea = 0;
+
+  for (const v of videos) {
+    if (!isLiveVideo(v)) continue;
+    const rect = v.getBoundingClientRect();
+    const area = rect.width * rect.height;
     if (area > bestArea) { bestArea = area; best = v; }
   }
+
   return best;
 }
 
-// ============================================================
-// 视频检测 + 悬浮录制栏
-// ============================================================
-function throttledBindAll() {
+function throttledBindAllVideos() {
   if (CS.bindTimeout) return;
   CS.bindTimeout = setTimeout(() => {
     CS.bindTimeout = null;
@@ -320,13 +269,14 @@ function initVideoDetection() {
     for (const m of mutations) {
       for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
-        if (node.tagName === 'VIDEO' || (node.querySelector && node.querySelector('video'))) {
+        if (node.tagName === 'VIDEO' ||
+            (node.querySelector && node.querySelector('video'))) {
           hasVideo = true; break;
         }
       }
       if (hasVideo) break;
     }
-    if (hasVideo) throttledBindAll();
+    if (hasVideo) throttledBindAllVideos();
   });
   CS.observer.observe(document.documentElement, { childList: true, subtree: true });
 }
@@ -336,7 +286,7 @@ function onGlobalMouseover(e) {
   if (!target) return;
 
   const video = findVideoNear(target);
-  if (video && isValidVideo(video)) {
+  if (video && isLiveVideo(video)) {
     clearTimeout(CS.leaveTimer);
     if (CS.hoverVideo !== video) {
       CS.hoverVideo = video;
@@ -360,17 +310,12 @@ function findVideoNear(target) {
     const v = target.querySelector('video');
     if (v) return v;
   }
-  if (target.closest) {
-    const c = target.closest([
-      '[class*="player"]','[class*="Player"]',
-      '[class*="video"]', '[class*="Video"]',
-      '[id*="player"]',  '[id*="Player"]',
-      'figure','main',
-    ].join(','));
-    if (c) {
-      const v = (c.shadowRoot && c.shadowRoot.querySelector('video')) || c.querySelector('video');
-      if (v) return v;
-    }
+  const container = target.closest
+    ? target.closest('[class*="player"],[class*="video"],[class*="Player"],[class*="Video"],figure,main')
+    : null;
+  if (container) {
+    const v = container.querySelector('video');
+    if (v) return v;
   }
   if (target.parentElement) {
     const v = target.parentElement.querySelector('video');
@@ -387,77 +332,116 @@ function bindVideo(video) {
   }, { passive: true });
 }
 
-function injectHoverStyle() {
-  if (document.getElementById('__rec_hover_style__')) return;
-  const s = document.createElement('style');
-  s.id    = '__rec_hover_style__';
-  s.textContent = `
+// ============================================================
+// 悬浮录制栏 UI
+// ============================================================
+function injectStyle() {
+  if (document.getElementById('__rec_style__')) return;
+  const style = document.createElement('style');
+  style.id = '__rec_style__';
+  style.textContent = `
     #__rec_hover_bar__ {
-      position:fixed; z-index:2147483647;
-      background:linear-gradient(135deg,#1a1a2e,#16213e);
-      border:1px solid rgba(229,57,53,.6);
-      border-top:3px solid #e53935;
-      border-radius:0 0 10px 10px; height:44px;
-      display:flex; align-items:center;
-      box-shadow:0 6px 24px rgba(229,57,53,.3),0 2px 8px rgba(0,0,0,.5);
-      font-family:'Microsoft YaHei','PingFang SC',Arial,sans-serif;
-      font-size:12px; color:#fff; overflow:hidden;
-      user-select:none; opacity:0;
-      transition:opacity .18s ease;
-      pointer-events:auto; min-width:280px;
+      position: fixed;
+      z-index: 2147483647;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      border: 1px solid #e53935;
+      border-top: 3px solid #e53935;
+      border-radius: 0 0 8px 8px;
+      height: 42px;
+      display: flex;
+      align-items: center;
+      box-shadow: 0 4px 20px rgba(229,57,53,0.35);
+      font-family: 'Microsoft YaHei', Arial, sans-serif;
+      font-size: 12px;
+      color: #fff;
+      overflow: hidden;
+      user-select: none;
+      opacity: 0;
+      transition: opacity 0.2s ease;
+      pointer-events: auto;
+      min-width: 280px;
     }
-    #__rec_hover_bar__.show { opacity:1; }
+    #__rec_hover_bar__.show { opacity: 1; }
     #__rec_hover_bar__ .hb-logo {
-      background:#e53935; width:42px; height:100%;
-      display:flex; align-items:center; justify-content:center;
-      flex-shrink:0; font-size:20px;
+      background: #e53935;
+      width: 40px;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      font-size: 18px;
     }
-    #__rec_hover_bar__ .hb-brand {
-      padding:0 10px 0 12px; font-size:12px;
-      font-weight:bold; color:#ff8a80; white-space:nowrap;
-      flex-shrink:0; height:100%;
-      display:flex; align-items:center;
-      border-right:1px solid rgba(255,255,255,.1);
+    #__rec_hover_bar__ .hb-title {
+      padding: 0 12px;
+      font-size: 12px;
+      color: #ff8a80;
+      font-weight: bold;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    #__rec_hover_bar__ .hb-divider {
+      width: 1px;
+      height: 24px;
+      background: #333;
+      flex-shrink: 0;
     }
     #__rec_hover_bar__ button {
-      background:transparent; border:none;
-      color:rgba(255,255,255,.85); height:100%;
-      padding:0 15px; cursor:pointer; font-size:12px;
-      font-family:inherit; display:flex; align-items:center;
-      gap:5px; white-space:nowrap;
-      transition:background .15s,color .15s;
-      border-left:1px solid rgba(255,255,255,.08);
+      background: transparent;
+      border: none;
+      color: #ddd;
+      height: 100%;
+      padding: 0 16px;
+      cursor: pointer;
+      font-size: 12px;
+      font-family: inherit;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      white-space: nowrap;
+      transition: all 0.15s;
+      border-left: 1px solid #333;
+    }
+    #__rec_hover_bar__ button:first-of-type {
+      border-left: none;
     }
     #__rec_hover_bar__ button:hover {
-      background:rgba(229,57,53,.25); color:#ff6b6b;
+      background: rgba(229,57,53,0.2);
+      color: #ff6b6b;
     }
-    #__rec_hover_bar__ .hb-rec {
-      color:#ff5252!important; font-weight:bold;
-      background:rgba(229,57,53,.12)!important;
+    #__rec_hover_bar__ .hb-rec-btn {
+      background: rgba(229,57,53,0.15) !important;
+      color: #ff5252 !important;
+      font-weight: bold;
     }
-    #__rec_hover_bar__ .hb-rec:hover {
-      background:rgba(229,57,53,.3)!important;
+    #__rec_hover_bar__ .hb-rec-btn:hover {
+      background: rgba(229,57,53,0.35) !important;
     }
     #__rec_hover_bar__ .hb-close {
-      color:rgba(255,255,255,.3)!important;
-      padding:0 12px!important; font-size:16px!important;
+      color: #666 !important;
+      padding: 0 12px !important;
+    }
+    #__rec_hover_bar__ .hb-close:hover {
+      background: rgba(255,255,255,0.05) !important;
+      color: #999 !important;
     }
   `;
-  (document.head || document.documentElement).appendChild(s);
+  (document.head || document.documentElement).appendChild(style);
 }
 
 function createHoverBar(video) {
   destroyHoverBar();
-  injectHoverStyle();
+  injectStyle();
 
   const bar = document.createElement('div');
   bar.id = '__rec_hover_bar__';
   bar.innerHTML = `
     <div class="hb-logo">🎬</div>
-    <div class="hb-brand">直播内录器</div>
-    <button class="hb-rec" id="__hb_rec__">⏺ 开始录制</button>
-    <button id="__hb_pip__">📺 小窗播放</button>
-    <button class="hb-close" id="__hb_close__">✕</button>
+    <div class="hb-title">直播内录器</div>
+    <div class="hb-divider"></div>
+    <button class="hb-rec-btn" id="__rb_rec__">⏺ 开始录制</button>
+    <button id="__rb_pip__">📺 小窗播放</button>
+    <button class="hb-close" id="__rb_close__">✕</button>
   `;
 
   bar.addEventListener('mouseenter', () => clearTimeout(CS.leaveTimer));
@@ -465,15 +449,15 @@ function createHoverBar(video) {
     CS.leaveTimer = setTimeout(destroyHoverBar, 400);
   });
 
-  bar.querySelector('#__hb_rec__').addEventListener('click', (e) => {
+  bar.querySelector('#__rb_rec__').addEventListener('click', (e) => {
     e.stopPropagation();
     onClickRecord(video);
   });
-  bar.querySelector('#__hb_pip__').addEventListener('click', (e) => {
+  bar.querySelector('#__rb_pip__').addEventListener('click', (e) => {
     e.stopPropagation();
     togglePiP(video);
   });
-  bar.querySelector('#__hb_close__').addEventListener('click', (e) => {
+  bar.querySelector('#__rb_close__').addEventListener('click', (e) => {
     e.stopPropagation();
     destroyHoverBar();
   });
@@ -500,64 +484,454 @@ function positionHoverBar(video) {
   const barW = CS.hoverBar.offsetWidth || 280;
   let left   = rect.left + rect.width / 2 - barW / 2;
   left       = Math.max(4, Math.min(left, window.innerWidth - barW - 4));
+  let top    = rect.top;
+  if (top < 0) top = Math.min(rect.bottom - 42, 0);
+  CS.hoverBar.style.top  = top + 'px';
   CS.hoverBar.style.left = left + 'px';
-  CS.hoverBar.style.top  = Math.max(0, rect.top) + 'px';
 }
 
 function destroyHoverBar() {
   clearTimeout(CS.leaveTimer);
   if (CS.hoverRAF) { cancelAnimationFrame(CS.hoverRAF); CS.hoverRAF = null; }
-  if (CS.hoverBar) {
-    CS.hoverBar.classList.remove('show');
-    setTimeout(() => { if (CS.hoverBar) { CS.hoverBar.remove(); CS.hoverBar = null; } }, 200);
-  }
+  if (CS.hoverBar) { CS.hoverBar.remove(); CS.hoverBar = null; }
   CS.hoverVideo = null;
 }
 
-function onClickRecord(video) {
-  const target = (video && isValidVideo(video)) ? video : pickBestVideo();
-  if (!target) {
-    showToast('❌ 未找到有效的直播视频，请确认视频正在播放');
-    return;
+// ============================================================
+// 开始录制触发
+// ============================================================
+async function onClickRecord(video) {
+  if (!video || !isLiveVideo(video)) {
+    video = pickBestLiveVideo();
+    if (!video) {
+      showToast('❌ 未找到有效的直播视频，请确认视频正在播放');
+      return;
+    }
   }
 
   destroyHoverBar();
-  showToast('🎬 正在提取隔离标签页，请在新弹出的控制台管理录制...');
+  REC.targetVideo = video;
 
+  showToast('🎬 正在启动保活内录引擎...');
+
+  const config = {
+    sysAudio  : true,
+    micAudio  : false,
+    noAudio   : false,
+    format    : 'mp4',
+    vbps      : 8000000,
+    abps      : 192000,
+    fps       : 30,
+    filePrefix: '直播录制',
+    quality   : 'hd',
+    autoStart : true
+  };
+
+  await startCapture(video, config);
+}
+
+// ============================================================
+// 核心： video.captureStream() 独占式视频提取 + 容灾备用
+// ============================================================
+async function startCapture(video, config) {
+  if (REC.isRecording) {
+    showToast('⚠️ 已在录制中');
+    return;
+  }
+
+  cleanupRecording(false);
+
+  REC.config     = config || {};
+  REC.chunks     = [];
+  REC.totalBytes = 0;
+  REC.seconds    = 0;
+  REC.isPaused   = false;
+  REC.prevBytes  = 0;
+  REC.prevTime   = performance.now();
+  REC.chunkSeq   = 0;
+  REC.sessionId  = 'cs_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+  REC.mimeType   = pickMime(config.format);
+
+  await idbPut('sessions', {
+    sessionId : REC.sessionId,
+    mimeType  : REC.mimeType,
+    prefix    : config.filePrefix || '直播录制',
+    startTime : Date.now(),
+    completed : false,
+  });
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // CORS 容灾降级检测：
+  // 某些平台由于强跨域安全限制，调用 video.captureStream()
+  // 会抛出 SecurityError 导致崩溃。我们在此设计了完美的 Try-Catch，
+  // 一旦捕获异常，立刻通知后台无缝切换到 tabCapture 备用录制管线！
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  let videoStream;
+  try {
+    const fps = config.fps || 30;
+    videoStream = video.captureStream(fps);
+  } catch (e) {
+    console.warn('[content-rec] 直播流由于跨域安全限制无法直提，激活 tabCapture 容灾管线...', e.message);
+    showToast('⚠️ 直播流受安全限制，已启动备用合成器捕获，切勿最小化本页...');
+
+    // 发送消息让 background 转交给控制面板 recorder.js 开启 tabCapture 备用内录
+    chrome.runtime.sendMessage({
+      action: 'fallbackToTabCapture',
+      config: config
+    }, () => { void chrome.runtime.lastError; });
+
+    await idbDeleteSession(REC.sessionId);
+    cleanupRecording(true);
+    return;
+  }
+
+  const videoTracks = videoStream.getVideoTracks();
+  if (!videoTracks.length) {
+    showToast('❌ 视频流中无视频轨道，视频可能未开始播放');
+    await idbDeleteSession(REC.sessionId);
+    return;
+  }
+
+  videoTracks[0].onended = () => {
+    if (REC.isRecording) {
+      showToast('⚠️ 直播流已断开，正在保存...');
+      doStop();
+    }
+  };
+
+  let finalStream;
+  if (config.noAudio) {
+    finalStream = new MediaStream(videoTracks);
+  } else if (config.micAudio) {
+    finalStream = await mixMicrophoneWithStream(videoStream);
+  } else {
+    finalStream = videoStream;
+  }
+
+  REC.captureStream = videoStream;
+  REC.mixedStream   = finalStream;
+
+  const vSettings = videoTracks[0].getSettings();
+  if (vSettings.width && vSettings.height) {
+    REC.config._resolution = vSettings.width + 'x' + vSettings.height;
+  } else {
+    REC.config._resolution = video.videoWidth + 'x' + video.videoHeight;
+  }
+
+  let recorder;
+  try {
+    recorder = new MediaRecorder(finalStream, {
+      mimeType           : REC.mimeType,
+      videoBitsPerSecond : config.vbps || 8_000_000,
+      audioBitsPerSecond : config.abps || 192_000,
+    });
+  } catch (e) {
+    try {
+      recorder = new MediaRecorder(finalStream, {
+        mimeType: 'video/webm',
+        videoBitsPerSecond: config.vbps || 8_000_000,
+      });
+      REC.mimeType = 'video/webm';
+    } catch (e2) {
+      showToast('❌ 无法创建录制器: ' + e2.message);
+      await idbDeleteSession(REC.sessionId);
+      cleanupRecording(true);
+      return;
+    }
+  }
+
+  recorder.ondataavailable = onData;
+  recorder.onstop          = onRecorderStop;
+  recorder.onerror = (ev) => {
+    console.error('[content-rec] MediaRecorder 错误:', ev.error);
+    doStop();
+  };
+
+  recorder.start(1000);
+  REC.mediaRecorder = recorder;
+  REC.isRecording   = true;
+
+  // 触发控制窗口开启保活 tabCapture
   chrome.runtime.sendMessage({
     action: 'startRecordFromContent',
-    config: {
-      sysAudio  : true,
-      micAudio  : false,
-      noAudio   : false,
-      format    : 'mp4',
-      vbps      : 8000000,
-      abps      : 192000,
-      fps       : 30,
-      filePrefix: '直播录制',
-      quality   : 'hd',
-    },
-  }, (resp) => {
-    void chrome.runtime.lastError;
-    if (resp && resp.error) {
-      showToast('❌ 启动失败: ' + resp.error);
-    }
-  });
+    config: config
+  }, () => { void chrome.runtime.lastError; });
+
+  showFloat('top-right');
+  startTimers();
+  notifyStateChanged(true, false);
 }
 
-async function togglePiP(video) {
-  try {
-    if (document.pictureInPictureElement === video) {
-      await document.exitPictureInPicture();
-      showToast('🪟 已退出小窗口播放');
-    } else {
-      await video.requestPictureInPicture();
-      showToast('🪟 小窗口播放已开启');
+function onData(e) {
+  if (!e.data || e.data.size === 0) return;
+  REC.chunks.push(e.data);
+  REC.totalBytes += e.data.size;
+  const seq = REC.chunkSeq++;
+  idbAddChunk({ sessionId: REC.sessionId, seq, blob: e.data, ts: Date.now() }).catch(() => {});
+}
+
+function doPause() {
+  if (!REC.mediaRecorder || REC.mediaRecorder.state !== 'recording') return;
+  REC.mediaRecorder.pause();
+  REC.isPaused = true;
+  notifyStateChanged(true, true);
+  updateFloatPauseBtn(true);
+}
+
+function doResume() {
+  if (!REC.mediaRecorder || REC.mediaRecorder.state !== 'paused') return;
+  REC.mediaRecorder.resume();
+  REC.isPaused = false;
+  notifyStateChanged(true, false);
+  updateFloatPauseBtn(false);
+}
+
+function doStop() {
+  if (!REC.isRecording && !REC.mediaRecorder) return;
+  REC.isRecording = false;
+  stopTimers();
+
+  if (REC.mediaRecorder && REC.mediaRecorder.state !== 'inactive') {
+    try { REC.mediaRecorder.stop(); } catch (_) {}
+  } else {
+    onRecorderStop();
+  }
+
+  removeFloat();
+}
+
+async function onRecorderStop() {
+  stopTimers();
+  removeFloat();
+
+  let chunks = REC.chunks;
+  if (!chunks.length && REC.sessionId) {
+    const idbChunks = await idbGetChunks(REC.sessionId);
+    chunks = idbChunks.map(c => c.blob);
+  }
+
+  if (!chunks.length) {
+    console.warn('[content-rec] 无录制数据');
+    notifyStateChanged(false, false);
+    cleanupRecording(true);
+    return;
+  }
+
+  const mime     = REC.mimeType || 'video/webm';
+  const blob     = new Blob(chunks, { type: mime });
+  const ext      = mime.includes('mp4') ? 'mp4' : 'webm';
+  const prefix   = (REC.config && REC.config.filePrefix) ? REC.config.filePrefix : '直播录制';
+  const ts       = new Date().toISOString().replace('T', '_').replace(/:/g, '-').slice(0, 19);
+  const filename = prefix + '_' + ts + '.' + ext;
+  const url      = URL.createObjectURL(blob);
+  REC.blobUrls.push(url);
+
+  chrome.runtime.sendMessage({ action: 'triggerDownload', url, filename }, (resp) => {
+    if (resp && resp.error) {
+      console.error('[content-rec] 下载失败:', resp.error);
     }
-  } catch (e) {
-    showToast('❌ 小窗口不可用: ' + e.message);
+  });
+
+  if (REC.sessionId) {
+    await idbPut('sessions', {
+      sessionId: REC.sessionId,
+      mimeType : mime,
+      prefix,
+      completed: true,
+      endTime  : Date.now(),
+    });
+    setTimeout(() => idbDeleteSession(REC.sessionId), 10000);
+  }
+
+  chrome.runtime.sendMessage({
+    action : 'notify',
+    message: '✅ 录制完成！' + fmtSize(REC.totalBytes) + ' · ' + fmtTime(REC.seconds),
+  }).catch(() => {});
+
+  showToast('✅ 录制完成，正在保存到下载目录...');
+  notifyStateChanged(false, false);
+  cleanupRecording(true);
+}
+
+function cleanupRecording(resetAll) {
+  stopTimers();
+
+  if (REC.captureStream) {
+    REC.captureStream = null;
+  }
+
+  if (REC.mixedStream) {
+    if (REC.audioCtx) {
+      REC.audioCtx.close().catch(() => {});
+      REC.audioCtx = null;
+    }
+    REC.mixedStream = null;
+  }
+
+  if (resetAll) {
+    REC.mediaRecorder = null;
+    REC.isRecording   = false;
+    REC.chunks        = [];
+    REC.chunkSeq      = 0;
+    REC.targetVideo   = null;
   }
 }
+
+async function mixMicrophoneWithStream(videoStream) {
+  try {
+    const micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 48000 },
+    });
+
+    const ctx = new AudioContext({ sampleRate: 48000 });
+    if (ctx.state === 'suspended') await ctx.resume();
+
+    const dest      = ctx.createMediaStreamDestination();
+    const videoTracks = videoStream.getVideoTracks();
+    const audioTracks = videoStream.getAudioTracks();
+
+    if (audioTracks.length) {
+      ctx.createMediaStreamSource(new MediaStream(audioTracks)).connect(dest);
+    }
+    ctx.createMediaStreamSource(micStream).connect(dest);
+
+    REC.audioCtx = ctx;
+
+    return new MediaStream([...videoTracks, ...dest.stream.getAudioTracks()]);
+  } catch (e) {
+    console.warn('[content-rec] 麦克风混音失败，降级:', e.message);
+    return videoStream;
+  }
+}
+
+// ============================================================
+// 计时器与性能监控
+// ============================================================
+function startTimers() {
+  stopTimers();
+
+  REC.timerInterval = setInterval(() => {
+    if (REC.isPaused) return;
+    REC.seconds++;
+    pushMetrics();
+  }, 1000);
+
+  REC.prevTime  = performance.now();
+  REC.prevBytes = 0;
+
+  REC.monInterval = setInterval(() => {
+    if (REC.isPaused) return;
+    const now = performance.now();
+    const dt  = Math.max((now - REC.prevTime) / 1000, 0.01);
+    const bps = ((REC.totalBytes - REC.prevBytes) / dt) * 8;
+    REC.prevBytes      = REC.totalBytes;
+    REC.prevTime       = now;
+    const kbps         = Math.round(bps / 1000);
+    REC.currentBitrate = kbps > 1000 ? (kbps / 1000).toFixed(1) + 'Mbps' : kbps + 'kbps';
+  }, 1000);
+}
+
+function stopTimers() {
+  if (REC.timerInterval) { clearInterval(REC.timerInterval); REC.timerInterval = null; }
+  if (REC.monInterval)   { clearInterval(REC.monInterval);   REC.monInterval   = null; }
+}
+
+function pushMetrics() {
+  const resolution = (REC.config && REC.config._resolution) ? REC.config._resolution : '-';
+  chrome.runtime.sendMessage({
+    action     : 'metricsUpdate',
+    isRecording: true,
+    isPaused   : REC.isPaused,
+    timeString : fmtTime(REC.seconds),
+    sizeString : fmtSize(REC.totalBytes),
+    bitrate    : REC.currentBitrate,
+    resolution,
+    fps        : (REC.config && REC.config.fps) ? REC.config.fps : 30,
+    cpu        : '0%',
+  }).catch(() => {});
+}
+
+function notifyStateChanged(isRecording, isPaused) {
+  chrome.runtime.sendMessage({
+    action: 'recordingStateChanged',
+    state : {
+      isRecording,
+      isPaused,
+      seconds   : REC.seconds,
+      sizeString: fmtSize(REC.totalBytes),
+      timeString: fmtTime(REC.seconds),
+      resolution: (REC.config && REC.config._resolution) || '-',
+      quality   : (REC.config && REC.config.quality) || 'hd',
+    },
+  }).catch(() => {});
+}
+
+// ============================================================
+// 消息监听
+// ============================================================
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  switch (msg.action) {
+    case 'showFloat':
+      showFloat(msg.position || 'top-right');
+      sendResponse({ ok: true });
+      break;
+
+    case 'removeFloat':
+      removeFloat();
+      sendResponse({ ok: true });
+      break;
+
+    case 'updateFloat':
+      updateFloat(msg.paused, msg.time);
+      sendResponse({ ok: true });
+      break;
+
+    case 'stopRecording':
+      if (REC.isRecording) doStop();
+      sendResponse({ ok: true });
+      break;
+
+    case 'pauseRecording':
+      if (REC.isRecording && !REC.isPaused) doPause();
+      sendResponse({ ok: true });
+      break;
+
+    case 'resumeRecording':
+      if (REC.isRecording && REC.isPaused) doResume();
+      sendResponse({ ok: true });
+      break;
+
+    case 'emergencySave':
+      if (REC.isRecording) {
+        showToast('⚠️ 录制窗口关闭，正在紧急保存...');
+        doStop();
+      }
+      sendResponse({ ok: true });
+      break;
+
+    case 'releaseBlobUrl':
+      if (msg && msg.url) {
+        URL.revokeObjectURL(msg.url);
+        REC.blobUrls = REC.blobUrls.filter(u => u !== msg.url);
+      }
+      sendResponse({ ok: true });
+      break;
+
+    case 'enableRegionSelect':
+      startRegion();
+      sendResponse({ ok: true });
+      break;
+
+    case 'disableRegionSelect':
+      stopRegion();
+      sendResponse({ ok: true });
+      break;
+
+    default:
+      sendResponse({ ok: false });
+  }
+  return true;
+});
 
 // ============================================================
 // 网页悬浮录制控制条
@@ -579,38 +953,58 @@ function showFloat(position) {
     'position:fixed',
     posMap[position] || posMap['top-right'],
     'z-index:2147483647',
-    'background:rgba(8,8,8,.97)',
+    'background:rgba(10,10,10,0.96)',
     'border:2px solid #e53935',
     'border-radius:12px',
     'padding:8px 14px',
-    'display:flex', 'align-items:center', 'gap:10px',
-    'font-family:Microsoft YaHei,PingFang SC,Arial,sans-serif',
-    'font-size:13px', 'color:#fff',
-    'box-shadow:0 4px 32px rgba(229,57,53,.55)',
-    'user-select:none', 'min-width:240px',
-    'backdrop-filter:blur(16px)',
+    'display:flex',
+    'align-items:center',
+    'gap:10px',
+    'font-family:Microsoft YaHei,Arial,sans-serif',
+    'font-size:13px',
+    'color:#fff',
+    'box-shadow:0 4px 30px rgba(229,57,53,0.5)',
+    'user-select:none',
+    'min-width:240px',
+    'backdrop-filter:blur(12px)',
     'cursor:move',
   ].join(';');
 
   bar.innerHTML = `
-    <style>@keyframes _rfb{0%,100%{opacity:1}50%{opacity:.1}}</style>
-    <span style="width:11px;height:11px;border-radius:50%;background:#e53935;
-      flex-shrink:0;display:inline-block;animation:_rfb 1s infinite;
-      box-shadow:0 0 8px rgba(229,57,53,.8);"></span>
-    <span id="_rf_time" style="font-family:'Courier New',monospace;
-      font-size:15px;font-weight:bold;color:#ff5252;letter-spacing:2px;
-      flex:1;min-width:80px;">00:00:00</span>
-    <button id="_rf_pause" style="background:rgba(255,152,0,.15);
-      border:1px solid rgba(255,152,0,.6);color:#ff9800;
-      padding:5px 12px;border-radius:6px;cursor:pointer;
-      font-size:11px;font-family:inherit;transition:all .2s;">⏸ 暂停</button>
-    <button id="_rf_stop" style="background:rgba(229,57,53,.15);
-      border:1px solid rgba(229,57,53,.6);color:#e53935;
-      padding:5px 12px;border-radius:6px;cursor:pointer;
-      font-size:11px;font-family:inherit;transition:all .2s;">⏹ 停止</button>
-    <button id="_rf_close" style="background:transparent;border:none;
-      color:rgba(255,255,255,.3);cursor:pointer;
-      font-size:20px;line-height:1;padding:0 2px;">×</button>
+    <style>
+      @keyframes _rfblink {0%,100%{opacity:1}50%{opacity:.1}}
+    </style>
+    <span style="
+      width:11px;height:11px;border-radius:50%;
+      background:#e53935;flex-shrink:0;display:inline-block;
+      animation:_rfblink 1s infinite;
+      box-shadow:0 0 6px #e53935;
+    "></span>
+    <span id="_rf_time" style="
+      font-family:'Courier New',monospace;
+      font-size:15px;font-weight:bold;
+      color:#ff5252;letter-spacing:2px;flex:1;
+    ">00:00:00</span>
+    <span id="_rf_size" style="font-size:11px;color:#888;margin-right:4px;">0MB</span>
+    <button id="_rf_pause" style="
+      background:rgba(255,152,0,0.15);
+      border:1px solid #ff9800;color:#ff9800;
+      padding:4px 11px;border-radius:5px;
+      cursor:pointer;font-size:11px;font-family:inherit;
+      transition:background 0.2s;
+    ">⏸ 暂停</button>
+    <button id="_rf_stop" style="
+      background:rgba(229,57,53,0.15);
+      border:1px solid #e53935;color:#e53935;
+      padding:4px 11px;border-radius:5px;
+      cursor:pointer;font-size:11px;font-family:inherit;
+      transition:background 0.2s;
+    ">⏹ 停止</button>
+    <button id="_rf_close" style="
+      background:transparent;border:none;
+      color:#555;cursor:pointer;font-size:20px;
+      line-height:1;padding:0 2px;
+    ">×</button>
   `;
 
   document.documentElement.appendChild(bar);
@@ -619,25 +1013,18 @@ function showFloat(position) {
   CS.floatPaused = false;
 
   bar.querySelector('#_rf_pause').addEventListener('click', () => {
-    CS.floatPaused = !CS.floatPaused;
-    bar.querySelector('#_rf_pause').textContent = CS.floatPaused ? '▶ 继续' : '⏸ 暂停';
-    chrome.runtime.sendMessage(
-      { _target: 'recorder', action: CS.floatPaused ? 'pauseRecording' : 'resumeRecording' },
-      () => { void chrome.runtime.lastError; }
-    );
+    if (REC.isRecording) {
+      if (REC.isPaused) doResume(); else doPause();
+    }
   });
 
   bar.querySelector('#_rf_stop').addEventListener('click', () => {
-    chrome.runtime.sendMessage(
-      { _target: 'recorder', action: 'stopRecording' },
-      () => { void chrome.runtime.lastError; }
-    );
-    removeFloat();
+    if (REC.isRecording) doStop();
+    else removeFloat();
   });
 
   bar.querySelector('#_rf_close').addEventListener('click', () => {
     removeFloat();
-    showToast('⚠️ 控制条已隐藏，录制仍在后台继续');
   });
 
   makeDraggable(bar);
@@ -652,9 +1039,16 @@ function removeFloat() {
 function updateFloat(paused, timeStr) {
   CS.floatPaused = !!paused;
   const te = document.getElementById('_rf_time');
-  const pe = document.getElementById('_rf_pause');
   if (te && timeStr) te.textContent = timeStr;
-  if (pe) pe.textContent = CS.floatPaused ? '▶ 继续' : '⏸ 暂停';
+  updateFloatPauseBtn(paused);
+
+  const se = document.getElementById('_rf_size');
+  if (se) se.textContent = fmtSize(REC.totalBytes);
+}
+
+function updateFloatPauseBtn(paused) {
+  const pe = document.getElementById('_rf_pause');
+  if (pe) pe.textContent = paused ? '▶ 继续' : '⏸ 暂停';
 }
 
 function startFloatTimer() {
@@ -665,6 +1059,8 @@ function startFloatTimer() {
     const el = document.getElementById('_rf_time');
     if (!el) { stopFloatTimer(); return; }
     el.textContent = fmtTime(CS.floatSec);
+    const se = document.getElementById('_rf_size');
+    if (se) se.textContent = fmtSize(REC.totalBytes);
   }, 1000);
 }
 
@@ -694,7 +1090,7 @@ function makeDraggable(el) {
 }
 
 function showToast(msg, ms) {
-  ms = ms || 3000;
+  ms = ms || 2800;
   let el = document.getElementById('__rec_toast__');
   if (!el) {
     el = document.createElement('div');
@@ -702,15 +1098,16 @@ function showToast(msg, ms) {
     el.style.cssText = [
       'position:fixed', 'bottom:80px', 'left:50%',
       'transform:translateX(-50%)',
-      'background:rgba(8,8,8,.97)',
-      'border:1px solid rgba(255,255,255,.15)',
-      'color:#fff', 'padding:12px 26px',
+      'background:rgba(10,10,10,0.96)',
+      'border:1px solid #444',
+      'color:#fff', 'padding:11px 24px',
       'border-radius:10px', 'font-size:13px',
-      'font-family:Microsoft YaHei,PingFang SC,Arial,sans-serif',
+      'font-family:Microsoft YaHei,Arial,sans-serif',
       'z-index:2147483647', 'pointer-events:none',
       'white-space:nowrap',
-      'box-shadow:0 4px 24px rgba(0,0,0,.6)',
+      'box-shadow:0 4px 24px rgba(0,0,0,0.5)',
       'transition:opacity .3s', 'opacity:0',
+      'max-width:90vw',
     ].join(';');
     document.documentElement.appendChild(el);
   }
@@ -720,30 +1117,41 @@ function showToast(msg, ms) {
   el.__t = setTimeout(() => { el.style.opacity = '0'; }, ms);
 }
 
-// ============================================================
-// 区域选择
-// ============================================================
+async function togglePiP(video) {
+  try {
+    if (document.pictureInPictureElement === video) {
+      await document.exitPictureInPicture();
+      showToast('🪟 已退出小窗口播放');
+    } else {
+      await video.requestPictureInPicture();
+      showToast('🪟 小窗口播放已开启');
+    }
+  } catch (e) {
+    showToast('❌ 小窗口不可用: ' + e.message);
+  }
+}
+
 function startRegion() {
   if (CS.regionActive) return;
   CS.regionActive = true;
 
   const overlay = document.createElement('div');
   overlay.style.cssText = [
-    'position:fixed','inset:0','z-index:2147483646',
-    'background:rgba(0,0,0,.45)','cursor:crosshair',
+    'position:fixed', 'inset:0', 'z-index:2147483646',
+    'background:rgba(0,0,0,0.4)', 'cursor:crosshair',
   ].join(';');
 
   const tip = document.createElement('div');
   tip.style.cssText = [
-    'position:fixed','top:50%','left:50%',
+    'position:fixed', 'top:50%', 'left:50%',
     'transform:translate(-50%,-50%)',
-    'background:rgba(229,57,53,.95)',
-    'color:#fff','padding:14px 32px','border-radius:10px',
-    'font-size:15px',
-    'font-family:Microsoft YaHei,PingFang SC,Arial,sans-serif',
-    'pointer-events:none','user-select:none','white-space:nowrap',
+    'background:rgba(229,57,53,0.95)',
+    'color:#fff', 'padding:14px 32px', 'border-radius:10px',
+    'font-size:15px', 'font-family:Microsoft YaHei,Arial',
+    'pointer-events:none', 'user-select:none', 'white-space:nowrap',
+    'box-shadow:0 4px 20px rgba(0,0,0,0.4)',
   ].join(';');
-  tip.textContent = '🔲 拖拽选择录制区域 · Esc 取消';
+  tip.textContent = '🔲 拖拽选择录制区域 | Esc 取消';
   overlay.appendChild(tip);
   document.documentElement.appendChild(overlay);
 
@@ -754,61 +1162,65 @@ function startRegion() {
     startX = e.clientX; startY = e.clientY;
     selBox = document.createElement('div');
     selBox.style.cssText = [
-      'position:fixed','border:2px dashed #e53935',
-      'background:rgba(229,57,53,.08)',
-      'pointer-events:none','z-index:2147483647',
+      'position:fixed', 'border:2px dashed #e53935',
+      'background:rgba(229,57,53,0.1)',
+      'pointer-events:none', 'z-index:2147483647',
+      'box-shadow:0 0 0 2000px rgba(0,0,0,0.3)',
     ].join(';');
     document.documentElement.appendChild(selBox);
   });
 
-  function onMove(e) {
+  document.addEventListener('mousemove', (e) => {
     if (!selBox) return;
     selBox.style.left   = Math.min(e.clientX, startX) + 'px';
     selBox.style.top    = Math.min(e.clientY, startY) + 'px';
     selBox.style.width  = Math.abs(e.clientX - startX) + 'px';
     selBox.style.height = Math.abs(e.clientY - startY) + 'px';
-  }
+  });
 
-  function onUp(e) {
+  document.addEventListener('mouseup', (e) => {
     if (!selBox) return;
     const w = Math.abs(e.clientX - startX);
     const h = Math.abs(e.clientY - startY);
     selBox.remove(); selBox = null;
     cleanup();
     if (w > 10 && h > 10) showToast('🔲 已选区域: ' + Math.round(w) + '×' + Math.round(h));
-  }
+  });
 
-  function onKey(e) {
+  document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (selBox) { selBox.remove(); selBox = null; }
     cleanup();
-    showToast('区域选择已取消');
-  }
+  });
 
   function cleanup() {
     CS.regionActive = false;
     overlay.remove();
-    document.removeEventListener('mousemove', onMove);
-    document.removeEventListener('mouseup',   onUp);
-    document.removeEventListener('keydown',   onKey);
   }
-
-  document.addEventListener('mousemove', onMove);
-  document.addEventListener('mouseup',   onUp);
-  document.addEventListener('keydown',   onKey);
 }
 
 function stopRegion() { CS.regionActive = false; }
 
-// ============================================================
-// 启动
-// ============================================================
+function pickMime(format) {
+  const mp4Candidates = [
+    'video/mp4;codecs=avc1.64001F,mp4a.40.2',
+    'video/mp4;codecs=avc1,mp4a.40.2',
+    'video/mp4;codecs=h264,aac',
+    'video/mp4',
+  ];
+  const webmCandidates = [
+    'video/webm;codecs=h264,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm;codecs=vp9,opus',
+    'video/webm',
+  ];
+  const list = format === 'mp4' ? mp4Candidates : webmCandidates;
+  return list.find(m => MediaRecorder.isTypeSupported(m)) || 'video/webm';
+}
+
+// ── 启动 ─────────────────────────────────────────────────────
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => {
-    initVideoDetection();
-    checkAndAutoIsolate();
-  });
+  document.addEventListener('DOMContentLoaded', () => { init().catch(console.error); });
 } else {
-  initVideoDetection();
-  checkAndAutoIsolate();
+  init().catch(console.error);
 }
