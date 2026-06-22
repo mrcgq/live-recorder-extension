@@ -1,19 +1,23 @@
 {
   "manifest_version": 3,
-  "name": "直播内录器 Pro",
-  "version": "3.1.0",
-  "description": "精准捕获网页直播视频流，仅录制纯净视频画面，采用 tabCapture 独占保活引擎，支持后台/切页全帧率流畅内录",
+  "name": "🎬 极简直播内录器 Pro",
+  "version": "3.2.0",
+  "description": "基于跨进程管道化隔离架构的轻量级直录器，0%网页卡顿，100%防崩自愈。",
   "permissions": [
     "activeTab",
     "storage",
     "downloads",
-    "tabCapture",
-    "scripting",
-    "tabs",
-    "notifications"
+    "tabCapture"
   ],
-  "host_permissions": [
-    "<all_urls>"
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
   ],
   "action": {
     "default_popup": "popup.html",
@@ -28,36 +32,10 @@
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
-  "background": {
-    "service_worker": "background.js"
-  },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "run_at": "document_idle",
-      "all_frames": true
-    }
-  ],
   "web_accessible_resources": [
     {
-      "resources": [
-        "icons/icon16.png",
-        "icons/icon48.png",
-        "icons/icon128.png",
-        "recorder.html"
-      ],
+      "resources": ["recorder.html"],
       "matches": ["<all_urls>"]
     }
-  ],
-  "commands": {
-    "start-stop-recording": {
-      "suggested_key": { "default": "Alt+R", "mac": "Alt+R" },
-      "description": "开始/停止录制"
-    },
-    "pause-recording": {
-      "suggested_key": { "default": "Alt+P", "mac": "Alt+P" },
-      "description": "暂停/继续录制"
-    }
-  }
+  ]
 }
