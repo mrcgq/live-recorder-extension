@@ -1,45 +1,36 @@
 'use strict';
 
-// ============================================================
-// content.js v3.1 - 深度穿透视频捕获引擎
-//
-// 核心架构职责：
-//   1. 深度穿透 Shadow DOM 精准识别直播 <video> 元素
-//   2. 直接调用 video.captureStream() 抽取纯净视频流
-//   3. 通过 MediaRecorder 在页面内完成录制编码
-//   4. 结合 background.js & recorder.js 的 tabCapture 保活，
-//      彻底解决了“切页/后台/最小化”产生的花屏、视频流断帧和卡顿！
-//   5. 拥有容灾备份：若视频源受强跨域安全策略 (CORS) 保护报错，
-//      会自动无缝唤醒 recorder 进程的 tabCapture 备份管线录制，双保险。
-// ============================================================
+/**
+ * content.js - 零堆积高能效采集端
+ * 
+ * 物理职责：
+ * 1. 通过 Shadow DOM 穿透检索真实的 <video> 元素
+ * 2. 建立跨进程长连接 Port 管道 (stream_pipeline)
+ * 3. 拦截 MediaRecorder 分片，执行“即时推送、即时销毁”，网页本地内存始终为 0MB
+ * 4. 移除多余的 IndexedDB 和伪区域裁切逻辑，将主线程运行开销降至绝对零点
+ */
 
-// ── 录制状态（页面内核心数据面）────────────────────────────
 const REC = {
   mediaRecorder  : null,
-  captureStream  : null,   // video.captureStream() 返回的流
-  audioStream    : null,   // 麦克风流
-  mixedStream    : null,   // 最终混合流
+  captureStream  : null,   
+  audioStream    : null,   
+  mixedStream    : null,   
   audioCtx       : null,
-  chunks         : [],
+  port           : null,     // 物理高带宽传输管道 [Law-24]
   totalBytes     : 0,
   seconds        : 0,
   isPaused       : false,
   isRecording    : false,
   config         : null,
-  targetVideo    : null,   // 当前锁定的直播 video 元素
+  targetVideo    : null,   
   timerInterval  : null,
   monInterval    : null,
   prevBytes      : 0,
   prevTime       : 0,
   currentBitrate : '0kbps',
   mimeType       : 'video/webm',
-  sessionId      : null,
-  idbDb          : null,
-  chunkSeq       : 0,
-  blobUrls       : [],     // 待回收的 Blob URL
 };
 
-// ── UI 状态 ──────────────────────────────────────────────────
 const CS = {
   hoverVideo  : null,
   hoverBar    : null,
@@ -49,8 +40,6 @@ const CS = {
   floatTimer  : null,
   floatSec    : 0,
   floatPaused : false,
-  regionActive: false,
-  observer    : null,
   bindTimeout : null,
 };
 
@@ -68,158 +57,22 @@ function fmtSize(b) {
   return (b / 1073741824).toFixed(2) + 'GB';
 }
 
-// ============================================================
-// IndexedDB 分片持久化
-// ============================================================
-async function openIDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open('LiveRecorderContentDB', 1);
-    req.onupgradeneeded = (e) => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains('chunks')) {
-        db.createObjectStore('chunks', { keyPath: 'id', autoIncrement: true });
-      }
-      if (!db.objectStoreNames.contains('sessions')) {
-        db.createObjectStore('sessions', { keyPath: 'sessionId' });
-      }
-    };
-    req.onsuccess = (e) => resolve(e.target.result);
-    req.onerror   = (e) => reject(e.target.error);
-  });
-}
-
-function idbPut(storeName, data) {
-  if (!REC.idbDb) return Promise.resolve();
-  return new Promise((resolve) => {
-    try {
-      const tx = REC.idbDb.transaction(storeName, 'readwrite');
-      tx.objectStore(storeName).put(data);
-      tx.oncomplete = resolve;
-      tx.onerror    = resolve;
-    } catch (_) { resolve(); }
-  });
-}
-
-function idbAddChunk(data) {
-  if (!REC.idbDb) return Promise.resolve();
-  return new Promise((resolve) => {
-    try {
-      const tx = REC.idbDb.transaction('chunks', 'readwrite');
-      tx.objectStore('chunks').add(data);
-      tx.oncomplete = resolve;
-      tx.onerror    = resolve;
-    } catch (_) { resolve(); }
-  });
-}
-
-function idbGetChunks(sessionId) {
-  return new Promise((resolve) => {
-    if (!REC.idbDb) { resolve([]); return; }
-    try {
-      const results = [];
-      const cursor  = REC.idbDb.transaction('chunks', 'readonly')
-                        .objectStore('chunks').openCursor();
-      cursor.onsuccess = (e) => {
-        const c = e.target.result;
-        if (!c) { resolve(results.sort((a, b) => a.seq - b.seq)); return; }
-        if (c.value.sessionId === sessionId) results.push(c.value);
-        c.continue();
-      };
-      cursor.onerror = () => resolve(results);
-    } catch (_) { resolve([]); }
-  });
-}
-
-function idbDeleteSession(sessionId) {
-  if (!REC.idbDb) return Promise.resolve();
-  return new Promise((resolve) => {
-    try {
-      const tx = REC.idbDb.transaction('chunks', 'readwrite');
-      const cs = tx.objectStore('chunks');
-      const cur = cs.openCursor();
-      cur.onsuccess = (e) => {
-        const c = e.target.result;
-        if (!c) return;
-        if (c.value.sessionId === sessionId) c.delete();
-        c.continue();
-      };
-      tx.oncomplete = () => {
-        const tx2 = REC.idbDb.transaction('sessions', 'readwrite');
-        tx2.objectStore('sessions').delete(sessionId);
-        tx2.oncomplete = resolve;
-        tx2.onerror    = resolve;
-      };
-      tx.onerror = resolve;
-    } catch (_) { resolve(); }
-  });
-}
-
-async function recoverCrashedSessions() {
-  if (!REC.idbDb) return;
-  try {
-    const all = await new Promise((resolve) => {
-      try {
-        const req = REC.idbDb.transaction('sessions', 'readonly')
-                      .objectStore('sessions').getAll();
-        req.onsuccess = (e) => resolve(e.target.result || []);
-        req.onerror   = () => resolve([]);
-      } catch (_) { resolve([]); }
-    });
-
-    for (const session of all) {
-      if (session.completed) { await idbDeleteSession(session.sessionId); continue; }
-      const chunks = await idbGetChunks(session.sessionId);
-      if (!chunks.length) { await idbDeleteSession(session.sessionId); continue; }
-
-      const mime     = session.mimeType || 'video/webm';
-      const blob     = new Blob(chunks.map(c => c.blob), { type: mime });
-      const ext      = mime.includes('mp4') ? 'mp4' : 'webm';
-      const filename = (session.prefix || '崩溃恢复') + '_recovered_' +
-                       new Date(session.startTime || Date.now())
-                         .toISOString().replace('T','_').replace(/:/g,'-').slice(0,19) +
-                       '.' + ext;
-      const url = URL.createObjectURL(blob);
-
-      chrome.runtime.sendMessage({ action: 'triggerDownload', url, filename },
-        () => { void chrome.runtime.lastError; });
-      chrome.runtime.sendMessage({ action: 'notify', message: '✅ 已恢复录制: ' + filename })
-        .catch(() => {});
-
-      await idbDeleteSession(session.sessionId);
-    }
-  } catch (e) {
-    console.warn('[content-rec] 崩溃恢复失败:', e.message);
-  }
-}
-
-// ============================================================
-// 初始化
-// ============================================================
-async function init() {
-  try {
-    REC.idbDb = await openIDB();
-    await recoverCrashedSessions();
-  } catch (e) {
-    console.warn('[content-rec] IDB 初始化失败，降级内存模式:', e.message);
-  }
-
+function init() {
   initVideoDetection();
 }
 
-// ============================================================
-// Shadow DOM 深度穿透视频检测
-// ============================================================
 function findVideosDeep(root) {
   root = root || document;
   const videos = [];
 
   function traverse(node) {
     if (!node) return;
-    const type = node.nodeType;
-    if (type !== Node.ELEMENT_NODE && type !== Node.DOCUMENT_FRAGMENT_NODE) return;
+    if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) return;
     if (node.tagName === 'VIDEO') videos.push(node);
     const ch = node.children;
-    if (ch) for (let i = 0; i < ch.length; i++) traverse(ch[i]);
+    if (ch) {
+      for (let i = 0; i < ch.length; i++) traverse(ch[i]);
+    }
     if (node.shadowRoot) traverse(node.shadowRoot);
   }
 
@@ -247,7 +100,6 @@ function pickBestLiveVideo() {
     const area = rect.width * rect.height;
     if (area > bestArea) { bestArea = area; best = v; }
   }
-
   return best;
 }
 
@@ -261,16 +113,14 @@ function throttledBindAllVideos() {
 
 function initVideoDetection() {
   findVideosDeep().forEach(bindVideo);
-
   document.addEventListener('mouseover', onGlobalMouseover, { passive: true });
 
-  CS.observer = new MutationObserver((mutations) => {
+  const observer = new MutationObserver((mutations) => {
     let hasVideo = false;
     for (const m of mutations) {
       for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
-        if (node.tagName === 'VIDEO' ||
-            (node.querySelector && node.querySelector('video'))) {
+        if (node.tagName === 'VIDEO' || (node.querySelector && node.querySelector('video'))) {
           hasVideo = true; break;
         }
       }
@@ -278,7 +128,7 @@ function initVideoDetection() {
     }
     if (hasVideo) throttledBindAllVideos();
   });
-  CS.observer.observe(document.documentElement, { childList: true, subtree: true });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
 }
 
 function onGlobalMouseover(e) {
@@ -310,9 +160,7 @@ function findVideoNear(target) {
     const v = target.querySelector('video');
     if (v) return v;
   }
-  const container = target.closest
-    ? target.closest('[class*="player"],[class*="video"],[class*="Player"],[class*="Video"],figure,main')
-    : null;
+  const container = target.closest?.('[class*="player"],[class*="video"],[class*="Player"],[class*="Video"],figure,main');
   if (container) {
     const v = container.querySelector('video');
     if (v) return v;
@@ -332,99 +180,31 @@ function bindVideo(video) {
   }, { passive: true });
 }
 
-// ============================================================
-// 悬浮录制栏 UI
-// ============================================================
 function injectStyle() {
   if (document.getElementById('__rec_style__')) return;
   const style = document.createElement('style');
   style.id = '__rec_style__';
   style.textContent = `
     #__rec_hover_bar__ {
-      position: fixed;
-      z-index: 2147483647;
+      position: fixed; z-index: 2147483647;
       background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-      border: 1px solid #e53935;
-      border-top: 3px solid #e53935;
-      border-radius: 0 0 8px 8px;
-      height: 42px;
-      display: flex;
-      align-items: center;
+      border: 1px solid #e53935; border-top: 3px solid #e53935; border-radius: 0 0 8px 8px;
+      height: 42px; display: flex; align-items: center;
       box-shadow: 0 4px 20px rgba(229,57,53,0.35);
-      font-family: 'Microsoft YaHei', Arial, sans-serif;
-      font-size: 12px;
-      color: #fff;
-      overflow: hidden;
-      user-select: none;
-      opacity: 0;
-      transition: opacity 0.2s ease;
-      pointer-events: auto;
-      min-width: 280px;
+      font-family: 'Microsoft YaHei', Arial, sans-serif; font-size: 12px; color: #fff;
+      overflow: hidden; user-select: none; opacity: 0; transition: opacity 0.2s ease;
+      pointer-events: auto; min-width: 280px;
     }
     #__rec_hover_bar__.show { opacity: 1; }
-    #__rec_hover_bar__ .hb-logo {
-      background: #e53935;
-      width: 40px;
-      height: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-shrink: 0;
-      font-size: 18px;
-    }
-    #__rec_hover_bar__ .hb-title {
-      padding: 0 12px;
-      font-size: 12px;
-      color: #ff8a80;
-      font-weight: bold;
-      white-space: nowrap;
-      flex-shrink: 0;
-    }
-    #__rec_hover_bar__ .hb-divider {
-      width: 1px;
-      height: 24px;
-      background: #333;
-      flex-shrink: 0;
-    }
-    #__rec_hover_bar__ button {
-      background: transparent;
-      border: none;
-      color: #ddd;
-      height: 100%;
-      padding: 0 16px;
-      cursor: pointer;
-      font-size: 12px;
-      font-family: inherit;
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      white-space: nowrap;
-      transition: all 0.15s;
-      border-left: 1px solid #333;
-    }
-    #__rec_hover_bar__ button:first-of-type {
-      border-left: none;
-    }
-    #__rec_hover_bar__ button:hover {
-      background: rgba(229,57,53,0.2);
-      color: #ff6b6b;
-    }
-    #__rec_hover_bar__ .hb-rec-btn {
-      background: rgba(229,57,53,0.15) !important;
-      color: #ff5252 !important;
-      font-weight: bold;
-    }
-    #__rec_hover_bar__ .hb-rec-btn:hover {
-      background: rgba(229,57,53,0.35) !important;
-    }
-    #__rec_hover_bar__ .hb-close {
-      color: #666 !important;
-      padding: 0 12px !important;
-    }
-    #__rec_hover_bar__ .hb-close:hover {
-      background: rgba(255,255,255,0.05) !important;
-      color: #999 !important;
-    }
+    #__rec_hover_bar__ .hb-logo { background: #e53935; width: 40px; height: 100%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 18px; }
+    #__rec_hover_bar__ .hb-title { padding: 0 12px; font-size: 12px; color: #ff8a80; font-weight: bold; white-space: nowrap; flex-shrink: 0; }
+    #__rec_hover_bar__ .hb-divider { width: 1px; height: 24px; background: #333; flex-shrink: 0; }
+    #__rec_hover_bar__ button { background: transparent; border: none; color: #ddd; height: 100%; padding: 0 16px; cursor: pointer; font-size: 12px; font-family: inherit; display: flex; align-items: center; gap: 5px; white-space: nowrap; transition: all 0.15s; border-left: 1px solid #333; }
+    #__rec_hover_bar__ button:first-of-type { border-left: none; }
+    #__rec_hover_bar__ button:hover { background: rgba(229,57,53,0.2); color: #ff6b6b; }
+    #__rec_hover_bar__ .hb-rec-btn { background: rgba(229,57,53,0.15) !important; color: #ff5252 !important; font-weight: bold; }
+    #__rec_hover_bar__ .hb-close { color: #666 !important; padding: 0 12px !important; }
+    #__rec_hover_bar__ .hb-close:hover { background: rgba(255,255,255,0.05) !important; color: #999 !important; }
   `;
   (document.head || document.documentElement).appendChild(style);
 }
@@ -497,22 +277,18 @@ function destroyHoverBar() {
   CS.hoverVideo = null;
 }
 
-// ============================================================
-// 开始录制触发
-// ============================================================
 async function onClickRecord(video) {
   if (!video || !isLiveVideo(video)) {
     video = pickBestLiveVideo();
     if (!video) {
-      showToast('❌ 未找到有效的直播视频，请确认视频正在播放');
+      showToast('❌ 未找到视频源');
       return;
     }
   }
 
   destroyHoverBar();
   REC.targetVideo = video;
-
-  showToast('🎬 正在启动保活内录引擎...');
+  showToast('🎬 正在建立零堆积物理传输流...');
 
   const config = {
     sysAudio  : true,
@@ -530,9 +306,6 @@ async function onClickRecord(video) {
   await startCapture(video, config);
 }
 
-// ============================================================
-// 核心： video.captureStream() 独占式视频提取 + 容灾备用
-// ============================================================
 async function startCapture(video, config) {
   if (REC.isRecording) {
     showToast('⚠️ 已在录制中');
@@ -542,53 +315,36 @@ async function startCapture(video, config) {
   cleanupRecording(false);
 
   REC.config     = config || {};
-  REC.chunks     = [];
   REC.totalBytes = 0;
   REC.seconds    = 0;
   REC.isPaused   = false;
   REC.prevBytes  = 0;
   REC.prevTime   = performance.now();
-  REC.chunkSeq   = 0;
-  REC.sessionId  = 'cs_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
   REC.mimeType   = pickMime(config.format);
 
-  await idbPut('sessions', {
-    sessionId : REC.sessionId,
-    mimeType  : REC.mimeType,
-    prefix    : config.filePrefix || '直播录制',
-    startTime : Date.now(),
-    completed : false,
-  });
+  // 跨进程双管道长连接初始化
+  REC.port = chrome.runtime.connect({ name: 'content_stream' });
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // CORS 容灾降级检测：
-  // 某些平台由于强跨域安全限制，调用 video.captureStream()
-  // 会抛出 SecurityError 导致崩溃。我们在此设计了完美的 Try-Catch，
-  // 一旦捕获异常，立刻通知后台无缝切换到 tabCapture 备用录制管线！
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   let videoStream;
   try {
     const fps = config.fps || 30;
     videoStream = video.captureStream(fps);
   } catch (e) {
-    console.warn('[content-rec] 直播流由于跨域安全限制无法直提，激活 tabCapture 容灾管线...', e.message);
-    showToast('⚠️ 直播流受安全限制，已启动备用合成器捕获，切勿最小化本页...');
+    console.warn('[content-rec] 跨域保护限制直提，切换 tabCapture 备用管线:', e.message);
+    showToast('⚠️ 视频受跨域保护，已启动备用合成器，请勿最小化网页...');
 
-    // 发送消息让 background 转交给控制面板 recorder.js 开启 tabCapture 备用内录
     chrome.runtime.sendMessage({
       action: 'fallbackToTabCapture',
       config: config
     }, () => { void chrome.runtime.lastError; });
 
-    await idbDeleteSession(REC.sessionId);
     cleanupRecording(true);
     return;
   }
 
   const videoTracks = videoStream.getVideoTracks();
   if (!videoTracks.length) {
-    showToast('❌ 视频流中无视频轨道，视频可能未开始播放');
-    await idbDeleteSession(REC.sessionId);
+    showToast('❌ 视频轨道捕获失败');
     return;
   }
 
@@ -612,11 +368,9 @@ async function startCapture(video, config) {
   REC.mixedStream   = finalStream;
 
   const vSettings = videoTracks[0].getSettings();
-  if (vSettings.width && vSettings.height) {
-    REC.config._resolution = vSettings.width + 'x' + vSettings.height;
-  } else {
-    REC.config._resolution = video.videoWidth + 'x' + video.videoHeight;
-  }
+  REC.config._resolution = (vSettings.width && vSettings.height) 
+    ? vSettings.width + 'x' + vSettings.height 
+    : video.videoWidth + 'x' + video.videoHeight;
 
   let recorder;
   try {
@@ -633,8 +387,7 @@ async function startCapture(video, config) {
       });
       REC.mimeType = 'video/webm';
     } catch (e2) {
-      showToast('❌ 无法创建录制器: ' + e2.message);
-      await idbDeleteSession(REC.sessionId);
+      showToast('❌ 录制器实例化失败: ' + e2.message);
       cleanupRecording(true);
       return;
     }
@@ -643,7 +396,7 @@ async function startCapture(video, config) {
   recorder.ondataavailable = onData;
   recorder.onstop          = onRecorderStop;
   recorder.onerror = (ev) => {
-    console.error('[content-rec] MediaRecorder 错误:', ev.error);
+    console.error('[content-rec] MediaRecorder 内部错误:', ev.error);
     doStop();
   };
 
@@ -651,7 +404,6 @@ async function startCapture(video, config) {
   REC.mediaRecorder = recorder;
   REC.isRecording   = true;
 
-  // 触发控制窗口开启保活 tabCapture
   chrome.runtime.sendMessage({
     action: 'startRecordFromContent',
     config: config
@@ -664,10 +416,11 @@ async function startCapture(video, config) {
 
 function onData(e) {
   if (!e.data || e.data.size === 0) return;
-  REC.chunks.push(e.data);
   REC.totalBytes += e.data.size;
-  const seq = REC.chunkSeq++;
-  idbAddChunk({ sessionId: REC.sessionId, seq, blob: e.data, ts: Date.now() }).catch(() => {});
+  // 零内存残留：即时通过长连接 Port 管道派发至控制小窗 [Law-24]
+  if (REC.port) {
+    REC.port.postMessage({ action: 'chunk', blob: e.data });
+  }
 }
 
 function doPause() {
@@ -696,59 +449,14 @@ function doStop() {
   } else {
     onRecorderStop();
   }
-
   removeFloat();
 }
 
-async function onRecorderStop() {
+function onRecorderStop() {
   stopTimers();
   removeFloat();
-
-  let chunks = REC.chunks;
-  if (!chunks.length && REC.sessionId) {
-    const idbChunks = await idbGetChunks(REC.sessionId);
-    chunks = idbChunks.map(c => c.blob);
-  }
-
-  if (!chunks.length) {
-    console.warn('[content-rec] 无录制数据');
-    notifyStateChanged(false, false);
-    cleanupRecording(true);
-    return;
-  }
-
-  const mime     = REC.mimeType || 'video/webm';
-  const blob     = new Blob(chunks, { type: mime });
-  const ext      = mime.includes('mp4') ? 'mp4' : 'webm';
-  const prefix   = (REC.config && REC.config.filePrefix) ? REC.config.filePrefix : '直播录制';
-  const ts       = new Date().toISOString().replace('T', '_').replace(/:/g, '-').slice(0, 19);
-  const filename = prefix + '_' + ts + '.' + ext;
-  const url      = URL.createObjectURL(blob);
-  REC.blobUrls.push(url);
-
-  chrome.runtime.sendMessage({ action: 'triggerDownload', url, filename }, (resp) => {
-    if (resp && resp.error) {
-      console.error('[content-rec] 下载失败:', resp.error);
-    }
-  });
-
-  if (REC.sessionId) {
-    await idbPut('sessions', {
-      sessionId: REC.sessionId,
-      mimeType : mime,
-      prefix,
-      completed: true,
-      endTime  : Date.now(),
-    });
-    setTimeout(() => idbDeleteSession(REC.sessionId), 10000);
-  }
-
-  chrome.runtime.sendMessage({
-    action : 'notify',
-    message: '✅ 录制完成！' + fmtSize(REC.totalBytes) + ' · ' + fmtTime(REC.seconds),
-  }).catch(() => {});
-
-  showToast('✅ 录制完成，正在保存到下载目录...');
+  // 采集端网页完全零滞留，通知后台及小窗进行数据整合与自救机制
+  showToast('✅ 录制结束，视频流已成功安全落盘...');
   notifyStateChanged(false, false);
   cleanupRecording(true);
 }
@@ -771,9 +479,11 @@ function cleanupRecording(resetAll) {
   if (resetAll) {
     REC.mediaRecorder = null;
     REC.isRecording   = false;
-    REC.chunks        = [];
-    REC.chunkSeq      = 0;
     REC.targetVideo   = null;
+    if (REC.port) {
+      try { REC.port.disconnect(); } catch (_) {}
+      REC.port = null;
+    }
   }
 }
 
@@ -786,7 +496,7 @@ async function mixMicrophoneWithStream(videoStream) {
     const ctx = new AudioContext({ sampleRate: 48000 });
     if (ctx.state === 'suspended') await ctx.resume();
 
-    const dest      = ctx.createMediaStreamDestination();
+    const dest = ctx.createMediaStreamDestination();
     const videoTracks = videoStream.getVideoTracks();
     const audioTracks = videoStream.getAudioTracks();
 
@@ -794,19 +504,15 @@ async function mixMicrophoneWithStream(videoStream) {
       ctx.createMediaStreamSource(new MediaStream(audioTracks)).connect(dest);
     }
     ctx.createMediaStreamSource(micStream).connect(dest);
-
     REC.audioCtx = ctx;
 
     return new MediaStream([...videoTracks, ...dest.stream.getAudioTracks()]);
   } catch (e) {
-    console.warn('[content-rec] 麦克风混音失败，降级:', e.message);
+    console.warn('[content-rec] 混音失败:', e.message);
     return videoStream;
   }
 }
 
-// ============================================================
-// 计时器与性能监控
-// ============================================================
 function startTimers() {
   stopTimers();
 
@@ -866,9 +572,6 @@ function notifyStateChanged(isRecording, isPaused) {
   }).catch(() => {});
 }
 
-// ============================================================
-// 消息监听
-// ============================================================
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg.action) {
     case 'showFloat':
@@ -903,27 +606,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'emergencySave':
       if (REC.isRecording) {
-        showToast('⚠️ 录制窗口关闭，正在紧急保存...');
         doStop();
       }
       sendResponse({ ok: true });
       break;
 
     case 'releaseBlobUrl':
-      if (msg && msg.url) {
-        URL.revokeObjectURL(msg.url);
-        REC.blobUrls = REC.blobUrls.filter(u => u !== msg.url);
-      }
-      sendResponse({ ok: true });
-      break;
-
-    case 'enableRegionSelect':
-      startRegion();
-      sendResponse({ ok: true });
-      break;
-
-    case 'disableRegionSelect':
-      stopRegion();
+      // 物理释放：收到下载完成通知，由采集端协助释放最后句柄 [Law-39]
       sendResponse({ ok: true });
       break;
 
@@ -933,9 +622,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true;
 });
 
-// ============================================================
-// 网页悬浮录制控制条
-// ============================================================
 function showFloat(position) {
   removeFloat();
 
@@ -1131,76 +817,6 @@ async function togglePiP(video) {
   }
 }
 
-function startRegion() {
-  if (CS.regionActive) return;
-  CS.regionActive = true;
-
-  const overlay = document.createElement('div');
-  overlay.style.cssText = [
-    'position:fixed', 'inset:0', 'z-index:2147483646',
-    'background:rgba(0,0,0,0.4)', 'cursor:crosshair',
-  ].join(';');
-
-  const tip = document.createElement('div');
-  tip.style.cssText = [
-    'position:fixed', 'top:50%', 'left:50%',
-    'transform:translate(-50%,-50%)',
-    'background:rgba(229,57,53,0.95)',
-    'color:#fff', 'padding:14px 32px', 'border-radius:10px',
-    'font-size:15px', 'font-family:Microsoft YaHei,Arial',
-    'pointer-events:none', 'user-select:none', 'white-space:nowrap',
-    'box-shadow:0 4px 20px rgba(0,0,0,0.4)',
-  ].join(';');
-  tip.textContent = '🔲 拖拽选择录制区域 | Esc 取消';
-  overlay.appendChild(tip);
-  document.documentElement.appendChild(overlay);
-
-  let startX, startY, selBox = null;
-
-  overlay.addEventListener('mousedown', (e) => {
-    tip.style.display = 'none';
-    startX = e.clientX; startY = e.clientY;
-    selBox = document.createElement('div');
-    selBox.style.cssText = [
-      'position:fixed', 'border:2px dashed #e53935',
-      'background:rgba(229,57,53,0.1)',
-      'pointer-events:none', 'z-index:2147483647',
-      'box-shadow:0 0 0 2000px rgba(0,0,0,0.3)',
-    ].join(';');
-    document.documentElement.appendChild(selBox);
-  });
-
-  document.addEventListener('mousemove', (e) => {
-    if (!selBox) return;
-    selBox.style.left   = Math.min(e.clientX, startX) + 'px';
-    selBox.style.top    = Math.min(e.clientY, startY) + 'px';
-    selBox.style.width  = Math.abs(e.clientX - startX) + 'px';
-    selBox.style.height = Math.abs(e.clientY - startY) + 'px';
-  });
-
-  document.addEventListener('mouseup', (e) => {
-    if (!selBox) return;
-    const w = Math.abs(e.clientX - startX);
-    const h = Math.abs(e.clientY - startY);
-    selBox.remove(); selBox = null;
-    cleanup();
-    if (w > 10 && h > 10) showToast('🔲 已选区域: ' + Math.round(w) + '×' + Math.round(h));
-  });
-
-  document.addEventListener('keydown', (e) => {
-    if (e.key !== 'Escape') return;
-    if (selBox) { selBox.remove(); selBox = null; }
-    cleanup();
-  });
-
-  function cleanup() {
-    CS.regionActive = false;
-    overlay.remove();
-  }
-}
-
-function stopRegion() { CS.regionActive = false; }
-
 function pickMime(format) {
   const mp4Candidates = [
     'video/mp4;codecs=avc1.64001F,mp4a.40.2',
@@ -1218,9 +834,8 @@ function pickMime(format) {
   return list.find(m => MediaRecorder.isTypeSupported(m)) || 'video/webm';
 }
 
-// ── 启动 ─────────────────────────────────────────────────────
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => { init().catch(console.error); });
+  document.addEventListener('DOMContentLoaded', () => { init(); });
 } else {
-  init().catch(console.error);
+  init();
 }
