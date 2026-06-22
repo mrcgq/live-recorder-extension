@@ -229,13 +229,21 @@
       <video id="previewPlayer" autoplay playsinline muted></video>
     </div>
 
+    <!-- 极轻量主动唤醒面板 [纠正 3] -->
     <div class="hint-box" id="hintBox">
       <p>
         <strong>📌 使用方式</strong><br>
         将鼠标移至直播网页中的视频画面<br>
-        点击出现的 <strong>「⏺ 开始录制」</strong> 按钮<br>
-        录制即自动开始，此窗口同步进行静默保活并实时预览
+        点击出现的 <strong>「⏺ 开始录制」</strong> 按钮即可。<br>
+        <span style="color: #666; font-size: 11px;">(全屏播放时，录制控制栏会自动挂载在全屏最上层)</span>
       </p>
+      
+      <!-- 主动直录强力唤醒按钮 -->
+      <div style="margin-top: 15px;">
+        <button class="sub-btn" id="btnActiveStart" style="background: #e53935; color: #fff; border: none; margin: 0 auto; font-weight: bold; width: 100%; border-radius: 6px;">
+          ⏺ 立即开始网页内直录
+        </button>
+      </div>
     </div>
 
     <!-- 录制控制（录制中显示）-->
