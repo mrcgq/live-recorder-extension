@@ -1,5 +1,3 @@
-
-
 'use strict';
 
 /**
@@ -7,7 +5,7 @@
  * 
  * 物理职责：
  * 1. 作为独立进程，接收 content.js 跨进程推送来的原始分片数据
- * 2. 物理加固：绑定控制面板 btnActiveStart 按钮，主动向原网页投递直录嗅探指令，规避鼠标悬浮局限 [纠正 3]
+ * 2. 物理精算：移除 init() 阶段有锁冲突风险的异步 clearOPFSTempFile，改由 FileSystemFileHandle 自动 truncate [纠正 1]
  * 3. 崩溃自愈保护：意外断网或页面进程死亡时，即刻关闭流强制落盘挽回
  */
 
@@ -57,10 +55,7 @@ function init() {
   updateFormat();
   bindEvents();
 
-  // [自愈加固] 启动时立刻擦除任何可能残留的本地临时落盘缓存，确保磁盘空间 0% 堆积 [Law-39]
-  clearOPFSTempFile();
-
-  // [自愈加固] 启动时立刻激活保活流与视频预览，保证保活流 100% 准备就绪
+  // [自愈加固二] 启动时立刻激活保活流与视频预览，保证保活流 100% 准备就绪，不再会有 65B 临时流损坏问题 [纠正 1]
   if (presetStreamId) {
     activateKeepAlive(presetStreamId);
   }
@@ -83,10 +78,17 @@ function init() {
   });
 }
 
+// ============================================================
+// OPFS 高性能持久化存储核心 [Law-52]
+// ============================================================
 async function initOPFS() {
   try {
     const root = await navigator.storage.getDirectory();
+    // 使用专属的私有缓存文件名，100% 避免普通网页脚本嗅探读取
     fileHandle = await root.getFileHandle('live_recording_cache.tmp', { create: true });
+    
+    // 【物理自愈 1】keepExistingData: false 会在创建文件流的瞬间，在物理层自动将文件 truncate 截断为 0 字节
+    // 根本不需要在 init 阶段去异步 removeEntry，彻底解决了两端同时读写同一个文件的物理文件锁冲突！
     writableStream = await fileHandle.createWritable({ keepExistingData: false });
     opfsInitialized = true;
     console.log('[OPFS] 高性能沙箱文件流初始化成功。');
@@ -108,6 +110,7 @@ async function writeToOPFS(blob) {
   }
 }
 
+// 物理合并落盘与安全恢复引擎
 async function finalizeOPFSRecording(config) {
   if (!writableStream) return;
   try {
@@ -150,6 +153,7 @@ async function finalizeOPFSRecording(config) {
   }
 }
 
+// 崩溃自愈保护：网页端突发死锁/强杀时紧急回收并合并已录制成果
 async function handleContentCrash() {
   console.warn('[OPFS] 警告：检测到网页长连接断开（网页可能崩溃）。执行紧急自愈保存...');
   if (writableStream) {
@@ -175,7 +179,7 @@ function bindEvents() {
   $('qHD').addEventListener('click',  () => setQuality('hd'));
   $('qSD').addEventListener('click',  () => setQuality('sd'));
 
-  // 物理加固：绑定小窗控制台的主动直录强力唤醒按纽 [纠正 3]
+  // 物理加固：绑定小窗控制台的主动直录强力唤醒按纽
   const activeStartBtn = $('btnActiveStart');
   if (activeStartBtn) {
     activeStartBtn.addEventListener('click', () => {
