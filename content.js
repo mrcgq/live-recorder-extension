@@ -1,7 +1,12 @@
 'use strict';
 
 // ============================================================
-// Content Script - 360 风格网页内录悬浮栏
+// content.js - 完整修复版 v2.3
+// C-01: 影子 DOM 深度穿透
+// C-02: 透明控制层穿透
+// C-03: 防抖冗余清理（单一 bindTimeout）
+// C-04: 悬浮栏事件完整绑定
+// C-05: 点击录制不自动开录（autoStart:false）
 // ============================================================
 
 const CS = {
@@ -20,148 +25,124 @@ const CS = {
 
 function fmtTime(s) {
   s = s || 0;
-  return [
-    Math.floor(s / 3600),
-    Math.floor((s % 3600) / 60),
-    s % 60,
-  ].map((n) => String(n).padStart(2, '0')).join(':');
+  return [Math.floor(s/3600), Math.floor((s%3600)/60), s%60]
+    .map(n => String(n).padStart(2,'0')).join(':');
 }
 
-// 接收来自 background 的消息
+// ── 消息监听 ─────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg.action) {
-    case 'showFloat':
-      showFloat(msg.position || 'top-right');
-      break;
-    case 'removeFloat':
-      removeFloat();
-      break;
-    case 'updateFloat':
-      updateFloat(msg.paused, msg.time);
-      break;
-    case 'enableRegionSelect':
-      startRegion();
-      break;
-    case 'disableRegionSelect':
-      stopRegion();
-      break;
+    case 'showFloat':         showFloat(msg.position || 'top-right'); break;
+    case 'removeFloat':       removeFloat();                          break;
+    case 'updateFloat':       updateFloat(msg.paused, msg.time);      break;
+    case 'enableRegionSelect':  startRegion();                        break;
+    case 'disableRegionSelect': stopRegion();                         break;
   }
   sendResponse({ ok: true });
   return true;
 });
 
-// 节流，避免 live chat 持续引起主线程卡顿 (Law-46)
-function throttledBindAllVideos() {
-  if (CS.bindTimeout) return;
-  CS.bindTimeout = setTimeout(() => {
-    bindAllVideos();
-    CS.bindTimeout = null;
-  }, 1000);
-}
-
-// ★ 深度优先遍历：穿透所有 Open 状态的 Shadow Root 寻找视频元素 (对齐 Law-11)
-function findVideosDeep(root = document) {
+// ── C-01: 影子 DOM 深度穿透 ──────────────────────────────────
+function findVideosDeep(root) {
+  root = root || document;
   const videos = [];
   function traverse(node) {
     if (!node) return;
-    if (node.tagName === 'VIDEO') {
-      videos.push(node);
-    }
-    if (node.children && node.children.length > 0) {
-      for (let i = 0; i < node.children.length; i++) {
-        traverse(node.children[i]);
-      }
-    }
-    // 穿透 Shadow Root 隔离墙
-    if (node.shadowRoot) {
-      traverse(node.shadowRoot);
-    }
+    const type = node.nodeType;
+    if (type !== Node.ELEMENT_NODE && type !== Node.DOCUMENT_FRAGMENT_NODE) return;
+    if (node.tagName === 'VIDEO') videos.push(node);
+    const children = node.children;
+    if (children) for (let i = 0; i < children.length; i++) traverse(children[i]);
+    if (node.shadowRoot) traverse(node.shadowRoot);
   }
   traverse(root);
   return videos;
 }
 
-// 全局流式指针嗅探：穿透透明控制图层与 Shadow DOM，100% 唤醒
+// ── C-03: 唯一防抖 ───────────────────────────────────────────
+function throttledBindAllVideos() {
+  if (CS.bindTimeout) return;
+  CS.bindTimeout = setTimeout(() => {
+    CS.bindTimeout = null;
+    findVideosDeep().forEach(bindVideo);
+  }, 1000);
+}
+
+// ── 初始化 ───────────────────────────────────────────────────
 function initVideoDetection() {
-  bindAllVideos();
+  findVideosDeep().forEach(bindVideo);
 
-  // 1. 全局 mouseover 嗅探（Bypass 控制遮罩层）
-  document.addEventListener('mouseover', (e) => {
-    let target = e.target;
-    if (!target) return;
+  // C-02: 全局 mouseover 穿透透明层
+  document.addEventListener('mouseover', onGlobalMouseover, { passive: true });
 
-    let video = null;
-    if (target.tagName === 'VIDEO') {
-      video = target;
-    } else {
-      // 如果目标元素有影子 DOM，尝试向内探测
-      if (target.shadowRoot) {
-        video = target.shadowRoot.querySelector('video');
-      }
-      if (!video) {
-        // 穿透遮罩层：向上或向内检索视频
-        video = target.querySelector('video') || 
-                (target.parentElement && target.parentElement.querySelector('video')) ||
-                (target.closest && target.closest('.player, .video-container, [class*="player"]') && target.closest('.player, .video-container, [class*="player"]').querySelector('video'));
-      }
-    }
-
-    if (video) {
-      clearTimeout(CS.leaveTimer);
-      const rect = video.getBoundingClientRect();
-      if (rect.width < 240 || rect.height < 130) return;
-
-      if (CS.hoverVideo !== video) {
-        CS.hoverVideo = video;
-        createHoverBar(video);
-      }
-    } else {
-      if (CS.hoverBar && !CS.hoverBar.contains(target)) {
-        CS.leaveTimer = setTimeout(destroyHoverBar, 600);
-      }
-    }
-  });
-
-  // 2. DOM 观察器
   CS.observer = new MutationObserver((mutations) => {
-    let hasVideoNode = false;
+    let hasVideo = false;
     for (const m of mutations) {
       for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
         if (node.tagName === 'VIDEO' || (node.querySelector && node.querySelector('video'))) {
-          hasVideoNode = true;
-          break;
+          hasVideo = true; break;
         }
       }
-      if (hasVideoNode) break;
+      if (hasVideo) break;
     }
-    if (hasVideoNode) {
-      throttledBindAllVideos();
-    }
+    if (hasVideo) throttledBindAllVideos();
   });
-
-  CS.observer.observe(document.documentElement, {
-    childList: true,
-    subtree: true,
-  });
+  CS.observer.observe(document.documentElement, { childList:true, subtree:true });
 }
 
-function bindAllVideos() {
-  findVideosDeep().forEach(bindVideo);
+function onGlobalMouseover(e) {
+  const target = e.target;
+  if (!target) return;
+  const video = findVideoNear(target);
+  if (video) {
+    clearTimeout(CS.leaveTimer);
+    const rect = video.getBoundingClientRect();
+    if (rect.width < 240 || rect.height < 130) return;
+    if (CS.hoverVideo !== video) { CS.hoverVideo = video; createHoverBar(video); }
+  } else {
+    if (CS.hoverBar && !CS.hoverBar.contains(target)) {
+      CS.leaveTimer = setTimeout(destroyHoverBar, 600);
+    }
+  }
+}
+
+function findVideoNear(target) {
+  if (!target) return null;
+  if (target.tagName === 'VIDEO') return target;
+  if (target.shadowRoot) {
+    const v = target.shadowRoot.querySelector('video');
+    if (v) return v;
+  }
+  if (target.querySelector) {
+    const v = target.querySelector('video');
+    if (v) return v;
+  }
+  if (target.closest) {
+    const container = target.closest(
+      '[class*="player"],[class*="video"],[class*="Player"],[class*="Video"],figure,article'
+    );
+    if (container) {
+      const v = container.querySelector('video');
+      if (v) return v;
+    }
+  }
+  if (target.parentElement) {
+    const v = target.parentElement.querySelector('video');
+    if (v) return v;
+  }
+  return null;
 }
 
 function bindVideo(video) {
   if (video.__recBound) return;
   video.__recBound = true;
-
   video.addEventListener('mouseleave', () => {
     CS.leaveTimer = setTimeout(destroyHoverBar, 600);
-  });
+  }, { passive: true });
 }
 
-// ============================================================
-// 创建 360 风格高保真网页悬浮录制栏
-// ============================================================
+// ── 悬浮录制栏 ───────────────────────────────────────────────
 function createHoverBar(video) {
   destroyHoverBar();
 
@@ -170,68 +151,31 @@ function createHoverBar(video) {
     style.id = '__rec_style__';
     style.textContent = `
       #__rec_hover_bar__ {
-        position: fixed;
-        z-index: 2147483647;
-        background: #ffffff;
-        border: 1px solid #dcdcdc;
-        border-top: 3px solid #10b981; /* 360 绿色顶线 */
-        border-radius: 0 0 6px 6px;
-        height: 38px;
-        display: flex;
-        align-items: center;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-        font-family: 'Microsoft YaHei', Arial, sans-serif;
-        font-size: 12px;
-        color: #333333;
-        overflow: hidden;
-        user-select: none;
-        opacity: 0;
-        transition: opacity 0.15s ease-in-out;
+        position:fixed; z-index:2147483647;
+        background:#fff; border:1px solid #dcdcdc;
+        border-top:3px solid #10b981;
+        border-radius:0 0 6px 6px; height:38px;
+        display:flex; align-items:center;
+        box-shadow:0 4px 12px rgba(0,0,0,.15);
+        font-family:'Microsoft YaHei',Arial,sans-serif;
+        font-size:12px; color:#333; overflow:hidden;
+        user-select:none; opacity:0;
+        transition:opacity .15s ease-in-out;
       }
-      #__rec_hover_bar__ .logo-section {
-        background: #10b981;
-        width: 34px;
-        height: 100%;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        flex-shrink: 0;
-      }
-      #__rec_hover_bar__ .logo-circle {
-        width: 20px;
-        height: 20px;
-        background: #ffffff;
-        border-radius: 50%;
-        color: #10b981;
-        font-weight: bold;
-        font-size: 13px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-      }
+      #__rec_hover_bar__ .logo { background:#10b981; width:34px; height:100%;
+        display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+      #__rec_hover_bar__ .logo span {
+        width:20px; height:20px; background:#fff; border-radius:50%;
+        color:#10b981; font-weight:bold; font-size:13px;
+        display:flex; align-items:center; justify-content:center; }
       #__rec_hover_bar__ button {
-        background: transparent;
-        border: none;
-        border-right: 1px solid #f0f0f0;
-        color: #444444;
-        height: 100%;
-        padding: 0 14px;
-        cursor: pointer;
-        font-size: 12px;
-        font-family: inherit;
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        white-space: nowrap;
-        transition: background 0.15s;
-      }
-      #__rec_hover_bar__ button:hover {
-        background: #f4f4f5;
-        color: #10b981;
-      }
-      #__rec_hover_bar__ button:last-child {
-        border-right: none;
-      }
+        background:transparent; border:none; border-right:1px solid #f0f0f0;
+        color:#444; height:100%; padding:0 14px; cursor:pointer;
+        font-size:12px; font-family:inherit;
+        display:flex; align-items:center; gap:5px;
+        white-space:nowrap; transition:background .15s; }
+      #__rec_hover_bar__ button:hover { background:#f4f4f5; color:#10b981; }
+      #__rec_hover_bar__ button:last-child { border-right:none; }
     `;
     (document.head || document.documentElement).appendChild(style);
   }
@@ -239,50 +183,27 @@ function createHoverBar(video) {
   const bar = document.createElement('div');
   bar.id = '__rec_hover_bar__';
   bar.innerHTML = `
-    <div class="logo-section">
-      <div class="logo-circle">e</div>
-    </div>
-    <button id="__rb_rec__">🎥 录制小视频</button>
-    <button id="__rb_clip__">✂️ 剪视频</button>
+    <div class="logo"><span>e</span></div>
+    <button id="__rb_rec__">🎥 录制</button>
     <button id="__rb_pip__">📺 小窗口</button>
-    <button id="__rb_settings__">⚙️ 设置</button>
-    <button id="__rb_close__" style="color: #999;">✕ 关闭</button>
+    <button id="__rb_close__" style="color:#aaa;">✕</button>
   `;
 
   bar.addEventListener('mouseenter', () => clearTimeout(CS.leaveTimer));
-  bar.addEventListener('mouseleave', () => {
-    CS.leaveTimer = setTimeout(destroyHoverBar, 400);
-  });
+  bar.addEventListener('mouseleave', () => { CS.leaveTimer = setTimeout(destroyHoverBar, 400); });
 
-  // 事件程序化注入
   bar.querySelector('#__rb_rec__').addEventListener('click', (e) => {
-    e.stopPropagation();
-    onClickRecord();
+    e.stopPropagation(); onClickRecord();
   });
-
-  bar.querySelector('#__rb_clip__').addEventListener('click', (e) => {
-    e.stopPropagation();
-    showInPageToast('✂️ 录制结束后，可在扩展面板【高级设置】进行视频裁剪');
-  });
-
   bar.querySelector('#__rb_pip__').addEventListener('click', (e) => {
-    e.stopPropagation();
-    togglePiP(video);
+    e.stopPropagation(); togglePiP(video);
   });
-
-  bar.querySelector('#__rb_settings__').addEventListener('click', (e) => {
-    e.stopPropagation();
-    showInPageToast('⚙️ 请点击右上角浏览器工具栏图标打开扩展设置');
-  });
-
   bar.querySelector('#__rb_close__').addEventListener('click', (e) => {
-    e.stopPropagation();
-    destroyHoverBar();
+    e.stopPropagation(); destroyHoverBar();
   });
 
   document.documentElement.appendChild(bar);
   CS.hoverBar = bar;
-
   positionHoverBar(video);
 
   requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -300,15 +221,10 @@ function createHoverBar(video) {
 function positionHoverBar(video) {
   if (!CS.hoverBar) return;
   const rect = video.getBoundingClientRect();
-  const barW = CS.hoverBar.offsetWidth  || 360;
-
-  let top  = rect.top + window.scrollY;
-  let left = rect.left + window.scrollX + (rect.width / 2) - (barW / 2);
-
-  // 保证不超出视频左右边界
-  if (left < rect.left + window.scrollX) left = rect.left + window.scrollX;
-
-  CS.hoverBar.style.top  = top  + 'px';
+  const barW = CS.hoverBar.offsetWidth || 220;
+  let left   = rect.left + rect.width / 2 - barW / 2;
+  left       = Math.max(rect.left, Math.min(left, window.innerWidth - barW - 4));
+  CS.hoverBar.style.top  = Math.max(0, rect.top) + 'px';
   CS.hoverBar.style.left = left + 'px';
 }
 
@@ -319,38 +235,32 @@ function destroyHoverBar() {
   CS.hoverVideo = null;
 }
 
+// C-05: 不自动开录
 function onClickRecord() {
   destroyHoverBar();
-  showFloat('top-right');
-  showInPageToast('🔴 正在启动录制，请在弹出的录制小窗口中进行控制...');
-
+  showInPageToast('🎬 正在打开录制窗口，请点击红色按钮开始录制...');
   chrome.runtime.sendMessage({
     action: 'startRecordFromContent',
     config: {
-      sysAudio: true,
-      micAudio: false,
-      noAudio: false,
-      format: 'mp4',
-      vbps: 6000000,
-      abps: 192000,
-      fps: 30,
-      filePrefix: '快照录制'
-    }
-  });
+      sysAudio  : true, micAudio: false, noAudio: false,
+      format    : 'mp4', vbps: 6000000, abps: 192000,
+      fps       : 30, filePrefix: '直播录制', quality: 'hd',
+      autoStart : false,  // ★ 打开窗口，不自动开录
+    },
+  }, () => { void chrome.runtime.lastError; });
 }
 
-// 物理级“小窗口”画中画接口 (一键Detached)
 async function togglePiP(video) {
   try {
     if (document.pictureInPictureElement === video) {
       await document.exitPictureInPicture();
-      showInPageToast('🪟 已退出小窗口播放');
+      showInPageToast('🪟 已退出小窗口');
     } else {
       await video.requestPictureInPicture();
-      showInPageToast('🪟 小窗口播放已开启');
+      showInPageToast('🪟 小窗口已开启');
     }
   } catch (e) {
-    showInPageToast('❌ 小窗口不可用: 视频未加载或受跨域保护');
+    showInPageToast('❌ 小窗口不可用: ' + e.message);
   }
 }
 
@@ -361,17 +271,17 @@ function showInPageToast(msg, ms) {
     el = document.createElement('div');
     el.id = '__rec_page_toast__';
     el.style.cssText = [
-      'position:fixed', 'bottom:80px', 'left:50%',
+      'position:fixed','bottom:80px','left:50%',
       'transform:translateX(-50%)',
-      'background:rgba(16,16,16,0.94)',
-      'border:1px solid #555', 'color:#fff',
-      'padding:10px 22px', 'border-radius:8px',
-      'font-size:13px;',
+      'background:rgba(16,16,16,.94)',
+      'border:1px solid #555','color:#fff',
+      'padding:10px 22px','border-radius:8px',
+      'font-size:13px',
       'font-family:Microsoft YaHei,Arial,sans-serif',
-      'z-index:2147483647', 'pointer-events:none',
+      'z-index:2147483647','pointer-events:none',
       'white-space:nowrap',
-      'box-shadow:0 4px 18px rgba(0,0,0,0.45)',
-      'transition:opacity 0.3s', 'opacity:0',
+      'box-shadow:0 4px 18px rgba(0,0,0,.45)',
+      'transition:opacity .3s','opacity:0',
     ].join(';');
     document.documentElement.appendChild(el);
   }
@@ -381,9 +291,9 @@ function showInPageToast(msg, ms) {
   el.__t = setTimeout(() => { el.style.opacity = '0'; }, ms);
 }
 
+// ── 网页悬浮录制控制条 ────────────────────────────────────────
 function showFloat(position) {
   removeFloat();
-
   const posMap = {
     'top-right'    : 'top:16px;right:16px;',
     'top-left'     : 'top:16px;left:16px;',
@@ -391,23 +301,19 @@ function showFloat(position) {
     'bottom-left'  : 'bottom:24px;left:16px;',
     'bottom-center': 'bottom:24px;left:50%;transform:translateX(-50%);',
   };
-
   const bar = document.createElement('div');
   bar.id = '__live_rec_float__';
   bar.style.cssText = [
-    'position:fixed',
-    posMap[position] || posMap['top-right'],
+    'position:fixed', posMap[position] || posMap['top-right'],
     'z-index:2147483647',
-    'background:rgba(13,13,13,0.94)',
-    'border:1.5px solid #e53935',
-    'border-radius:10px',
-    'padding:8px 14px',
-    'display:flex', 'align-items:center', 'gap:10px',
+    'background:rgba(13,13,13,.94)',
+    'border:1.5px solid #e53935','border-radius:10px',
+    'padding:8px 14px','display:flex','align-items:center','gap:10px',
     'font-family:Microsoft YaHei,Arial,sans-serif',
-    'font-size:13px', 'color:#fff',
-    'box-shadow:0 4px 24px rgba(229,57,53,0.4)',
-    'user-select:none', 'min-width:220px',
-    'backdrop-filter:blur(10px)', 'cursor:move',
+    'font-size:13px','color:#fff',
+    'box-shadow:0 4px 24px rgba(229,57,53,.4)',
+    'user-select:none','min-width:220px',
+    'backdrop-filter:blur(10px)','cursor:move',
   ].join(';');
 
   bar.innerHTML = `
@@ -415,9 +321,7 @@ function showFloat(position) {
     <span style="width:10px;height:10px;border-radius:50%;background:#e53935;
       flex-shrink:0;display:inline-block;animation:_rfb 1s infinite;"></span>
     <span id="_rf_time" style="font-family:'Courier New',monospace;
-      font-size:14px;font-weight:bold;color:#ff6666;letter-spacing:1px;flex:1;">
-      00:00:00
-    </span>
+      font-size:14px;font-weight:bold;color:#ff6666;letter-spacing:1px;flex:1;">00:00:00</span>
     <button id="_rf_pause" style="background:rgba(255,152,0,.15);border:1px solid #ff9800;
       color:#ff9800;padding:4px 10px;border-radius:5px;cursor:pointer;
       font-size:11px;font-family:inherit;">⏸ 暂停</button>
@@ -425,7 +329,7 @@ function showFloat(position) {
       color:#e53935;padding:4px 10px;border-radius:5px;cursor:pointer;
       font-size:11px;font-family:inherit;">⏹ 停止</button>
     <button id="_rf_close" style="background:transparent;border:none;
-      color:#666;cursor:pointer;font-size:18px;line-height:1;padding:0 2px;">×</button>
+      color:#555;cursor:pointer;font-size:18px;line-height:1;padding:0 2px;">×</button>
   `;
 
   document.documentElement.appendChild(bar);
@@ -435,26 +339,22 @@ function showFloat(position) {
 
   bar.querySelector('#_rf_pause').addEventListener('click', () => {
     CS.floatPaused = !CS.floatPaused;
-    bar.querySelector('#_rf_pause').textContent =
-      CS.floatPaused ? '▶ 继续' : '⏸ 暂停';
-
-    const action = CS.floatPaused ? 'pauseRecording' : 'resumeRecording';
+    bar.querySelector('#_rf_pause').textContent = CS.floatPaused ? '▶ 继续' : '⏸ 暂停';
     chrome.runtime.sendMessage(
-      { action, _target: 'recorder' },
-      () => void chrome.runtime.lastError
+      { action: CS.floatPaused ? 'pauseRecording' : 'resumeRecording', _target:'recorder' },
+      () => { void chrome.runtime.lastError; }
     );
   });
 
   bar.querySelector('#_rf_stop').addEventListener('click', () => {
     chrome.runtime.sendMessage(
-      { action: 'stopRecording', _target: 'recorder' },
-      () => void chrome.runtime.lastError
+      { action:'stopRecording', _target:'recorder' },
+      () => { void chrome.runtime.lastError; }
     );
     removeFloat();
   });
 
-  bar.querySelector('#__live_rec_float__ #_rf_close' || '#_rf_close').addEventListener('click', removeFloat);
-
+  bar.querySelector('#_rf_close').addEventListener('click', removeFloat);
   makeDraggable(bar);
   startFloatTimer();
 }
@@ -487,122 +387,69 @@ function stopFloatTimer() {
   if (CS.floatTimer) { clearInterval(CS.floatTimer); CS.floatTimer = null; }
 }
 
-// ============================================================
-// 拖拽
-// ============================================================
 function makeDraggable(el) {
   let drag = false, sx, sy, ox, oy;
-
   el.addEventListener('mousedown', (e) => {
     if (e.target.tagName === 'BUTTON') return;
-    drag = true;
-    sx = e.clientX; sy = e.clientY;
-    const r = el.getBoundingClientRect();
-    ox = r.left; oy = r.top;
+    drag = true; sx = e.clientX; sy = e.clientY;
+    const r = el.getBoundingClientRect(); ox = r.left; oy = r.top;
     e.preventDefault();
   });
-
   document.addEventListener('mousemove', (e) => {
     if (!drag) return;
-    el.style.left      = ox + e.clientX - sx + 'px';
-    el.style.top       = oy + e.clientY - sy + 'px';
-    el.style.right     = 'auto';
-    el.style.bottom    = 'auto';
-    el.style.transform = 'none';
+    el.style.left = ox + e.clientX - sx + 'px';
+    el.style.top  = oy + e.clientY - sy + 'px';
+    el.style.right = 'auto'; el.style.bottom = 'auto'; el.style.transform = 'none';
   });
-
   document.addEventListener('mouseup', () => { drag = false; });
 }
 
+// ── 区域选择 ─────────────────────────────────────────────────
 function startRegion() {
   if (CS.regionActive) return;
   CS.regionActive = true;
-
   const overlay = document.createElement('div');
-  overlay.style.cssText = [
-    'position:fixed', 'inset:0', 'z-index:2147483646',
-    'background:rgba(0,0,0,0.32)', 'cursor:crosshair',
-  ].join(';');
-
+  overlay.style.cssText = ['position:fixed','inset:0','z-index:2147483646','background:rgba(0,0,0,.32)','cursor:crosshair'].join(';');
   const tip = document.createElement('div');
-  tip.style.cssText = [
-    'position:fixed', 'top:50%', 'left:50%',
-    'transform:translate(-50%,-50%)',
-    'background:rgba(229,57,53,0.93)',
-    'color:#fff', 'padding:12px 28px', 'border-radius:8px',
-    'font-size:15px', 'font-family:Microsoft YaHei,Arial',
-    'pointer-events:none', 'user-select:none', 'white-space:nowrap',
-  ].join(';');
+  tip.style.cssText = ['position:fixed','top:50%','left:50%','transform:translate(-50%,-50%)','background:rgba(229,57,53,.93)','color:#fff','padding:12px 28px','border-radius:8px','font-size:15px','font-family:Microsoft YaHei,Arial','pointer-events:none','user-select:none','white-space:nowrap'].join(';');
   tip.textContent = '🔲 拖拽选择录制区域 | Esc 取消';
   overlay.appendChild(tip);
   document.documentElement.appendChild(overlay);
-
   let startX, startY, selBox = null;
-
   const onDown = (e) => {
-    tip.style.display = 'none';
-    startX = e.clientX; startY = e.clientY;
+    tip.style.display = 'none'; startX = e.clientX; startY = e.clientY;
     selBox = document.createElement('div');
-    selBox.style.cssText = [
-      'position:fixed',
-      'border:2px solid #e53935',
-      'background:rgba(229,57,53,0.08)',
-      'pointer-events:none',
-      'z-index:2147483647',
-    ].join(';');
+    selBox.style.cssText = ['position:fixed','border:2px solid #e53935','background:rgba(229,57,53,.08)','pointer-events:none','z-index:2147483647'].join(';');
     document.documentElement.appendChild(selBox);
   };
-
   const onMove = (e) => {
     if (!selBox) return;
-    const x = Math.min(e.clientX, startX);
-    const y = Math.min(e.clientY, startY);
-    const w = Math.abs(e.clientX - startX);
-    const h = Math.abs(e.clientY - startY);
-    selBox.style.left   = x + 'px';
-    selBox.style.top    = y + 'px';
-    selBox.style.width  = w + 'px';
-    selBox.style.height = h + 'px';
+    selBox.style.left   = Math.min(e.clientX,startX) + 'px';
+    selBox.style.top    = Math.min(e.clientY,startY) + 'px';
+    selBox.style.width  = Math.abs(e.clientX-startX) + 'px';
+    selBox.style.height = Math.abs(e.clientY-startY) + 'px';
   };
-
   const onUp = (e) => {
-    const rect = {
-      x     : Math.min(e.clientX, startX),
-      y     : Math.min(e.clientY, startY),
-      width : Math.abs(e.clientX - startX),
-      height: Math.abs(e.clientY - startY),
-    };
+    const w = Math.abs(e.clientX-startX), h = Math.abs(e.clientY-startY);
     if (selBox) { selBox.remove(); selBox = null; }
     cleanup();
-    if (rect.width > 10 && rect.height > 10) {
-      showInPageToast('🔲 已选区域: ' + rect.width + '×' + rect.height);
-    }
+    if (w > 10 && h > 10) showInPageToast('🔲 已选区域: ' + w + '×' + h);
   };
-
-  const onKey = (e) => {
-    if (e.key !== 'Escape') return;
-    if (selBox) { selBox.remove(); selBox = null; }
-    cleanup();
-  };
-
+  const onKey = (e) => { if (e.key !== 'Escape') return; if (selBox) { selBox.remove(); selBox = null; } cleanup(); };
   function cleanup() {
-    CS.regionActive = false;
-    overlay.remove();
+    CS.regionActive = false; overlay.remove();
     overlay.removeEventListener('mousedown', onDown);
     document.removeEventListener('mousemove', onMove);
-    document.removeEventListener('mouseup',   onUp);
-    document.removeEventListener('keydown',   onKey);
+    document.removeEventListener('mouseup', onUp);
+    document.removeEventListener('keydown', onKey);
   }
-
   overlay.addEventListener('mousedown', onDown);
   document.addEventListener('mousemove', onMove);
-  document.addEventListener('mouseup',   onUp);
-  document.addEventListener('keydown',   onKey);
+  document.addEventListener('mouseup', onUp);
+  document.addEventListener('keydown', onKey);
 }
 
-function stopRegion() {
-  CS.regionActive = false;
-}
+function stopRegion() { CS.regionActive = false; }
 
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', initVideoDetection);
