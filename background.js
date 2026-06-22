@@ -1,7 +1,7 @@
 'use strict';
 
 // ============================================================
-// Background Service Worker v4.1 - 窗口抽取与标签隔离版
+// Background Service Worker v4.2 - 动态窗口裁剪与自适应隔离版
 // ============================================================
 
 let recordingState = {
@@ -35,7 +35,6 @@ chrome.runtime.onConnect.addListener((port) => {
 // 独立提取与复位逻辑
 // ============================================================
 
-// 辅助 Promise 封装
 function getTabAsync(tabId) {
   return new Promise((resolve) => {
     chrome.tabs.get(tabId, (tab) => {
@@ -76,7 +75,7 @@ function createMinWindowAsync(tabId) {
   });
 }
 
-// 提取当前目标标签页并将其移入一个独立的最小化窗口中（实现网页端在眼前“消失”）
+// 提取当前目标标签页并将其移入一个独立的最小化窗口中
 async function isolateTabToMinimizedWindow(tabId) {
   const tab = await getTabAsync(tabId);
   if (!tab) throw new Error('无法读取目标标签页');
@@ -86,8 +85,7 @@ async function isolateTabToMinimizedWindow(tabId) {
 
   const tabsInWin = await queryTabsAsync({ windowId: originalWindowId });
   if (tabsInWin.length === 1) {
-    // 如果原窗口中只有这一个标签页，为了避免移动它导致原窗口关闭，
-    // 我们先在原窗口新建一个空白标签页供用户继续使用
+    // 防止移动唯一标签页导致原窗口自动关闭，新建一个空白标签页
     await createTabAsync({ windowId: originalWindowId, active: true });
   }
 
@@ -129,7 +127,6 @@ async function restoreHostWindow() {
       chrome.windows.update(originalWindowId, { focused: true });
       console.log('[bg] ★ 标签页已成功复原并聚焦');
     } else {
-      // 原窗口已被关闭，降级处理：直接将临时的最小化窗口恢复显示
       if (tempWindowId) {
         chrome.windows.update(tempWindowId, { state: 'normal', focused: true }, () => {
           void chrome.runtime.lastError;
@@ -227,13 +224,13 @@ async function handlePopupCommand(msg) {
       recordingState.activeTabId = tabId;
 
       try {
-        // Step 1: 提取目标标签页放入独立最小化窗口 (网页端瞬间“消失”，但不中断后台渲染)
+        // Step 1: 提取目标标签页放入独立最小化窗口
         await isolateTabToMinimizedWindow(tabId);
 
         // Step 2: 获取隔离后的 streamId
         const streamId = await getStreamIdForTab(tabId);
 
-        // Step 3: 通知 content.js 执行深度 DOM 视频隔离
+        // Step 3: 通知 content.js 执行深度 DOM 隔离清洗
         broadcastToTab(tabId, { action: 'applyViewportSanitize' });
 
         // Step 4: 打开并聚焦录制控制小窗
@@ -272,7 +269,34 @@ function sanitizeFilename(raw) {
 // ============================================================
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 
-  // ── 1. recorder.js 请求 streamId ─────────────────────────────
+  // ── 1. content 握手：标签页加载时，验证其是否为录制的目标 ──
+  if (req.action === 'checkIfIResultInRecording') {
+    const tabId = sender.tab && sender.tab.id;
+    // 只要有 activeTabId 记录，即判定为该页面是录制隔离的目标
+    const isTarget = !!(tabId && tabId === recordingState.activeTabId);
+    sendResponse({ isRecordingTarget: isTarget });
+    return;
+  }
+
+  // ── 2. 动态调节隔离窗口的尺寸，使视频流完全铺满画面，消除黑边 ──
+  if (req.action === 'resizeIsolatedWindow') {
+    if (recordingState.tempWindowId) {
+      let w = Math.max(360, Math.min(req.width, 3840));
+      let h = Math.max(360, Math.min(req.height, 2160));
+
+      chrome.windows.update(recordingState.tempWindowId, {
+        width: w,
+        height: h
+      }, () => {
+        void chrome.runtime.lastError;
+        console.log(`[bg] ★ 隔离窗口已根据直播流比例重置大小: ${w}x${h}`);
+      });
+    }
+    sendResponse({ ok: true });
+    return;
+  }
+
+  // ── 3. recorder.js 请求 streamId ─────────────────────────────
   if (req.action === 'getTabStreamId') {
     const tabId = parseInt(req.tabId);
     if (!tabId) { sendResponse({ error: 'invalid_tab_id' }); return; }
@@ -285,7 +309,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return true;
   }
 
-  // ── 2. 实时指标回传 ──────────────────────────────────────────
+  // ── 4. 实时指标回传 ──────────────────────────────────────────
   if (req.action === 'metricsUpdate') {
     Object.assign(recordingState, {
       isRecording: req.isRecording,
@@ -310,7 +334,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       });
     }
 
-    // 同步更新网页悬浮控制条 (广播给用户当前正在浏览的页面，而不是被录制的那页，防止控制条被录进视频)
+    // 更新当前页面悬浮控制条
     broadcastToActiveTab({
       action: 'updateFloat',
       paused: req.isPaused,
@@ -321,7 +345,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return;
   }
 
-  // ── 3. 录制状态变更 ──────────────────────────────────────────
+  // ── 5. 录制状态变更 ──────────────────────────────────────────
   if (req.action === 'recordingStateChanged') {
     const wasRecording = recordingState.isRecording;
     Object.assign(recordingState, req.state);
@@ -345,7 +369,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return;
   }
 
-  // ── 4. 安全下载 ──────────────────────────────────────────────
+  // ── 6. 安全下载 ──────────────────────────────────────────────
   if (req.action === 'triggerDownload') {
     const safeName = sanitizeFilename(req.filename);
     chrome.downloads.download({
@@ -376,7 +400,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return true;
   }
 
-  // ── 5. content.js 网页悬浮栏触发录制 ─────────────────────────────
+  // ── 7. content.js 网页悬浮栏触发录制 ─────────────────────────────
   if (req.action === 'startRecordFromContent') {
     const tab      = sender.tab;
     const tabId    = tab && tab.id;
@@ -388,7 +412,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 
     (async () => {
       try {
-        // Step 1: 提取标签页放入独立最小化窗口 (宿主窗口正常保留，网页端瞬间消失)
+        // Step 1: 提取标签页放入独立最小化窗口
         await isolateTabToMinimizedWindow(tabId);
 
         // Step 2: 获取隔离后的 streamId
@@ -414,19 +438,18 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       }
     })();
 
-    return true; // 保持通道异步
+    return true;
   }
 
-  // ── 6. 显示网页悬浮控制条 ────────────────────────────────────
+  // ── 8. 显示网页悬浮控制条 ────────────────────────────────────
   if (req.action === 'showFloat') {
     const pos = req.position || 'top-right';
-    // 控制条必须展示在当前活跃的浏览标签页，而决不能在被隔离录制的标签页展示，防止被录入视频中
     broadcastToActiveTab({ action: 'showFloat', position: pos });
     sendResponse({ ok: true });
     return;
   }
 
-  // ── 7. 系统通知 ──────────────────────────────────────────────
+  // ── 9. 系统通知 ──────────────────────────────────────────────
   if (req.action === 'notify') {
     if (chrome.notifications) {
       chrome.notifications.create('rec_' + Date.now(), {
@@ -440,7 +463,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return;
   }
 
-  // ── 8. 悬浮窗控制按钮转发 ────────────────────────────────────
+  // ── 10. 悬浮窗控制按钮转发 ────────────────────────────────────
   if (req.action === 'floatPause' || req.action === 'floatStop') {
     const action = req.action === 'floatStop' ? 'stopRecording' : 'pauseRecording';
     chrome.runtime.sendMessage({ _target: 'recorder', action }).catch(() => {});
