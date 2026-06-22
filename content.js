@@ -4,9 +4,9 @@
  * content.js - 零堆积高能效采集端
  * 
  * 物理职责：
- * 1. 穿透 Shadow DOM，支持多级父代溯源扫描，强力锚定 <video>
- * 2. 正常退出时发送握手完结消息，规避小窗产生崩溃恢复警告
- * 3. 100ms 物理时序缓冲保证 IPC 通信冲刷完毕 [Law-39]
+ * 1. 穿透 Shadow DOM，支持多级父代层析扫描，精准锁定 <video>
+ * 2. 物理精算：无视频的 iframe 立即静默退出，决不声明异步，消除 Port 通道污染 [纠正 2]
+ * 3. 时序加固：正常完结时引入 100ms 物理缓冲，防止握手消息被 disconnect 截断 [纠正 3]
  */
 
 const REC = {
@@ -462,7 +462,7 @@ function onRecorderStop() {
     } catch (_) {}
   }
 
-  // 物理加固：引入 100ms 时序缓冲，给 IPC 通道留出绝对安全的冲刷时间再进行 disconnect（Law-39）
+  // [纠正 3] 引入 100ms 物理时序缓冲，保障 complete 完结握手彻底冲刷进入 IPC 通道后再执行断连 [时序加固]
   setTimeout(() => {
     cleanupRecording(true);
   }, 100);
@@ -579,65 +579,52 @@ function notifyStateChanged(isRecording, isPaused) {
   }).catch(() => {});
 }
 
-// 物理自愈：解决 Chrome 广播消息时 iframe 响应抢跑、造成 Top Frame 误报的严重 regression
+// 物理自愈：精准控制 frame 级响应行为，无 video 的 iframe 必须彻底保持静默，绝不抢发 sendResponse [纠正 2]
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  switch (msg.action) {
-    case 'start_recording_now':
-      const video = pickBestLiveVideo();
-      if (video) {
-        (async () => {
+  if (msg.action === 'start_recording_now') {
+    const video = pickBestLiveVideo();
+    if (video) {
+      (async () => {
+        try {
           await startCapture(video, msg.config);
           sendResponse({ ok: true, frame: window.location.href });
-        })();
-        return true; 
-      }
-      break;
-
-    case 'showFloat':
-      showFloat(msg.position || 'top-right');
-      sendResponse({ ok: true });
-      break;
-
-    case 'removeFloat':
-      removeFloat();
-      sendResponse({ ok: true });
-      break;
-
-    case 'updateFloat':
-      updateFloat(msg.paused, msg.time);
-      sendResponse({ ok: true });
-      break;
-
-    case 'stopRecording':
-      if (REC.isRecording) doStop();
-      sendResponse({ ok: true });
-      break;
-
-    case 'pauseRecording':
-      if (REC.isRecording && !REC.isPaused) doPause();
-      sendResponse({ ok: true });
-      break;
-
-    case 'resumeRecording':
-      if (REC.isRecording && REC.isPaused) doResume();
-      sendResponse({ ok: true });
-      break;
-
-    case 'emergencySave':
-      if (REC.isRecording) {
-        doStop();
-      }
-      sendResponse({ ok: true });
-      break;
-
-    case 'releaseBlobUrl':
-      sendResponse({ ok: true });
-      break;
-
-    default:
-      sendResponse({ ok: false });
+        } catch (e) {
+          sendResponse({ ok: false, error: e.message });
+        }
+      })();
+      return true; // 仅在这个真正开始直录的 Frame 中进行异步回复
+    }
+    return false; // 如果本 Frame 内没有发现活动播放器，立即静默退出，决不声明异步
   }
-  return true;
+
+  // 其他控制消息（属于单向广播，快速响应即可）
+  if (msg.action === 'showFloat') {
+    showFloat(msg.position || 'top-right');
+    sendResponse({ ok: true });
+  } else if (msg.action === 'removeFloat') {
+    removeFloat();
+    sendResponse({ ok: true });
+  } else if (msg.action === 'updateFloat') {
+    updateFloat(msg.paused, msg.time);
+    sendResponse({ ok: true });
+  } else if (msg.action === 'stopRecording') {
+    if (REC.isRecording) doStop();
+    sendResponse({ ok: true });
+  } else if (msg.action === 'pauseRecording') {
+    if (REC.isRecording && !REC.isPaused) doPause();
+    sendResponse({ ok: true });
+  } else if (msg.action === 'resumeRecording') {
+    if (REC.isRecording && REC.isPaused) doResume();
+    sendResponse({ ok: true });
+  } else if (msg.action === 'emergencySave') {
+    if (REC.isRecording) doStop();
+    sendResponse({ ok: true });
+  } else if (msg.action === 'releaseBlobUrl') {
+    sendResponse({ ok: true });
+  } else {
+    sendResponse({ ok: false });
+  }
+  return false; 
 });
 
 function showFloat(position) {
@@ -673,6 +660,43 @@ function showFloat(position) {
     'backdrop-filter:blur(12px)',
     'cursor:move',
   ].join(';');
+
+  bar.innerHTML = `
+    <style>
+      @keyframes _rfblink {0%,100%{opacity:1}50%{opacity:.1}}
+    </style>
+    <span style="
+      width:11px;height:11px;border-radius:50%;
+      background:#e53935;flex-shrink:0;display:inline-block;
+      animation:_rfblink 1s infinite;
+      box-shadow:0 0 6px #e53935;
+    "></span>
+    <span id="_rf_time" style="
+      font-family:'Courier New',monospace;
+      font-size:15px;font-weight:bold;
+      color:#ff5252;letter-spacing:2px;flex:1;
+    ">00:00:00</span>
+    <span id="_rf_size" style="font-size:11px;color:#888;margin-right:4px;">0MB</span>
+    <button id="_rf_pause" style="
+      background:rgba(255,152,0,0.15);
+      border:1px solid #ff9800;color:#ff9800;
+      padding:4px 11px;border-radius:5px;
+      cursor:pointer;font-size:11px;font-family:inherit;
+      transition:background 0.2s;
+    ">⏸ 暂停</button>
+    <button id="_rf_stop" style="
+      background:rgba(229,57,53,0.15);
+      border:1px solid #e53935;color:#e53935;
+      padding:4px 11px;border-radius:5px;
+      cursor:pointer;font-size:11px;font-family:inherit;
+      transition:background 0.2s;
+    ">⏹ 停止</button>
+    <button id="_rf_close" style="
+      background:transparent;border:none;
+      color:#555;cursor:pointer;font-size:20px;
+      line-height:1;padding:0 2px;
+    ">×</button>
+  `;
 
   const activeFullscreenEl = document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement;
   const appendTarget = activeFullscreenEl || document.body || document.documentElement;
@@ -823,5 +847,3 @@ if (document.readyState === 'loading') {
 } else {
   init();
 }
-
-
