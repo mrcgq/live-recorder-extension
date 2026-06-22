@@ -2,262 +2,271 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <title>直播内录器 · 录制控制</title>
+  <title>直播内录器 - 控制面板</title>
   <style>
     * { margin:0; padding:0; box-sizing:border-box; }
-
-    :root {
-      --red      : #e53935;
-      --red-dim  : rgba(229,57,53,0.2);
-      --orange   : #ff9800;
-      --green    : #4caf50;
-      --bg0      : #0a0a0a;
-      --bg1      : #141414;
-      --bg2      : #1c1c1c;
-      --bg3      : #242424;
-      --border   : #2a2a2a;
-      --text-main: #f0f0f0;
-      --text-sub : #888;
-      --text-dim : #444;
-    }
-
     body {
       width:100vw; height:100vh;
-      font-family:'Microsoft YaHei','PingFang SC',Arial,sans-serif;
-      background:var(--bg0); color:var(--text-main);
+      font-family:'Microsoft YaHei',Arial,sans-serif;
+      background:#0d0d0d; color:#fff;
       display:flex; flex-direction:column;
       overflow:hidden; user-select:none;
     }
 
-    /* ── 标题栏 ── */
-    .title-bar {
-      background:var(--bg1);
-      padding:0 16px;
-      height:46px;
+    /* 标题栏 */
+    .win-header {
+      background:#1a1a1a; padding:10px 16px;
       display:flex; align-items:center; justify-content:space-between;
-      border-bottom:2px solid var(--red);
-      flex-shrink:0;
+      border-bottom:2px solid #e53935; flex-shrink:0;
     }
-    .title-left {
+    .win-title {
       display:flex; align-items:center; gap:10px;
+      font-size:14px; font-weight:bold; color:#fff;
     }
-    .title-logo {
-      width:28px; height:28px;
-      background:linear-gradient(135deg,#e53935,#ff6f00);
-      border-radius:6px;
-      display:flex; align-items:center; justify-content:center;
-      font-size:16px; flex-shrink:0;
-    }
-    .title-text { font-size:14px; font-weight:bold; color:var(--text-main); }
-    .title-sub  { font-size:11px; color:var(--text-dim); margin-top:1px; }
     .rec-dot {
-      width:9px; height:9px; border-radius:50%;
-      background:var(--red); display:none;
-      animation:blink 1.1s infinite;
-      box-shadow:0 0 6px var(--red);
-    }
-    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
-
-    /* ── 错误条 ── */
-    .error-bar {
-      display:none; background:#2a0f0f;
-      border-bottom:1px solid var(--red);
-      padding:8px 16px; font-size:12px;
-      color:#ff8a80; flex-shrink:0;
-    }
-
-    /* ── 视频预览区（★ R-02：tabCapture 流实时预览）── */
-    .preview-wrap {
-      flex:1; background:#000;
-      display:flex; align-items:center; justify-content:center;
-      position:relative; overflow:hidden; min-height:0;
-    }
-    #previewPlayer {
-      width:100%; height:100%;
-      object-fit:contain; display:block;
-    }
-    .preview-overlay {
-      position:absolute; inset:0;
-      display:flex; flex-direction:column;
-      align-items:center; justify-content:center;
-      gap:14px; pointer-events:none;
-    }
-    .preview-overlay .idle-icon { font-size:52px; opacity:.25; }
-    .preview-overlay .idle-text {
-      font-size:13px; color:var(--text-dim);
-      line-height:1.8; text-align:center;
-    }
-    .preview-overlay .idle-text strong { color:var(--text-sub); }
-
-    /* 录制时的实时时钟水印 */
-    .rec-watermark {
-      position:absolute; top:12px; left:12px;
-      background:rgba(0,0,0,0.7);
-      border:1px solid rgba(229,57,53,0.5);
-      border-radius:6px; padding:4px 10px;
-      font-family:'Courier New',monospace;
-      font-size:13px; font-weight:bold;
-      color:#ff5252; letter-spacing:1px;
+      width:10px; height:10px; border-radius:50%;
+      background:#e53935; animation:pulse 1.2s infinite;
       display:none;
     }
-    .rec-watermark.show { display:block; }
+    @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(.8)} }
+    .win-subtitle { font-size:11px; color:#666; }
 
-    /* ── 底部控制台 ── */
-    .console {
-      background:var(--bg1);
-      border-top:1px solid var(--border);
+    /* 状态横幅 */
+    .status-banner {
+      background:#111; border-bottom:1px solid #222;
       padding:10px 16px;
-      display:flex; align-items:center;
-      justify-content:space-between; gap:14px;
+      display:flex; align-items:center; justify-content:space-between;
       flex-shrink:0;
     }
-
-    /* 左侧：质量 + 暂停 */
-    .console-left { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-
-    .q-btn {
-      background:var(--bg3); border:1px solid var(--border);
-      color:var(--text-sub); padding:6px 13px;
-      border-radius:5px; font-size:11px;
-      cursor:pointer; font-weight:bold;
-      transition:all .2s; font-family:inherit;
+    .status-left { display:flex; align-items:center; gap:10px; }
+    .status-indicator {
+      width:10px; height:10px; border-radius:50%;
+      background:#3a3a3a; transition:background .3s;
     }
-    .q-btn:hover { border-color:var(--red); color:var(--text-main); }
+    .status-indicator.ready    { background:#4caf50; }
+    .status-indicator.recording { background:#e53935; animation:pulse 1s infinite; }
+    .status-indicator.paused   { background:#ff9800; }
+    .status-text { font-size:13px; color:#bbb; }
+
+    .timer-display {
+      font-family:'Courier New',monospace;
+      font-size:22px; font-weight:bold;
+      color:#555; letter-spacing:3px;
+      transition:color .3s;
+    }
+    .timer-display.recording { color:#ff3b30; }
+    .timer-display.paused    { color:#ff9800; }
+
+    /* 指标仪表 */
+    .metrics-bar {
+      background:#161616; border-bottom:1px solid #222;
+      padding:8px 16px;
+      display:flex; gap:20px; align-items:center;
+      flex-shrink:0;
+    }
+    .metric {
+      display:flex; align-items:center; gap:5px;
+      font-size:11px; color:#666;
+    }
+    .metric-val {
+      font-family:'Courier New',monospace;
+      color:#4caf50; font-weight:bold; font-size:12px;
+    }
+    .metric-val.hot { color:#ff5252; }
+
+    /* 主控区 */
+    .main-section {
+      flex:1; display:flex; flex-direction:column;
+      align-items:center; justify-content:center;
+      gap:16px; padding:16px;
+    }
+
+    /* 实时视频预览（保活核心） */
+    #previewContainer {
+      width: 100%;
+      max-width: 440px;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid #333;
+      display: none;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+    }
+    #previewPlayer {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    /* 大录制按钮 */
+    .big-rec-btn {
+      width:80px; height:80px; border-radius:50%;
+      border:4px solid #e53935; background:transparent;
+      cursor:pointer; display:flex; align-items:center; justify-content:center;
+      transition:all .3s; position:relative;
+    }
+    .big-rec-btn:hover {
+      box-shadow:0 0 30px rgba(229,57,53,0.6);
+      transform:scale(1.05);
+    }
+    .big-rec-inner {
+      width:36px; height:36px; border-radius:50%;
+      background:#e53935; transition:all .3s;
+    }
+    .big-rec-btn.recording .big-rec-inner {
+      border-radius:6px; width:28px; height:28px;
+    }
+    .big-rec-btn.paused .big-rec-inner {
+      background:#ff9800; border-radius:3px;
+      width:8px; height:28px; box-shadow:12px 0 0 #ff9800;
+    }
+    .rec-btn-label {
+      font-size:12px; color:#666; text-align:center; margin-top:4px;
+    }
+
+    /* 副控按钮组 */
+    .sub-controls {
+      display:flex; gap:12px;
+    }
+    .sub-btn {
+      background:#1e1e1e; border:1px solid #333;
+      color:#bbb; padding:10px 24px; border-radius:8px;
+      font-size:13px; cursor:pointer; font-family:inherit;
+      transition:all .2s; display:flex; align-items:center; gap:6px;
+    }
+    .sub-btn:hover:not(:disabled) { border-color:#666; color:#fff; background:#2a2a2a; }
+    .sub-btn:disabled { opacity:0.3; cursor:not-allowed; }
+    .sub-btn.danger:hover:not(:disabled) { border-color:#e53935; color:#e53935; }
+    .sub-btn.warn:hover:not(:disabled)   { border-color:#ff9800; color:#ff9800; }
+
+    /* 质量选择 */
+    .quality-section {
+      display:flex; gap:8px; align-items:center;
+    }
+    .q-label { font-size:11px; color:#555; margin-right:4px; }
+    .q-btn {
+      background:#1e1e1e; border:1px solid #333;
+      color:#888; padding:7px 18px; border-radius:6px;
+      font-size:12px; cursor:pointer; font-weight:bold;
+      transition:all .2s;
+    }
+    .q-btn:hover { border-color:#e53935; color:#fff; }
     .q-btn.active {
       background:linear-gradient(135deg,#1565c0,#0d47a1);
       border-color:#2196f3; color:#fff;
-      box-shadow:0 0 10px rgba(33,150,243,.3);
+      box-shadow:0 0 10px rgba(33,150,243,.35);
     }
     .q-btn.uhd.active {
       background:linear-gradient(135deg,#6a1b9a,#4a148c);
       border-color:#9c27b0;
-      box-shadow:0 0 10px rgba(156,39,176,.3);
+      box-shadow:0 0 10px rgba(156, 39, 176, .35);
     }
 
-    .pause-btn {
-      background:rgba(255,152,0,.1);
-      border:1px solid rgba(255,152,0,.5);
-      color:var(--orange); padding:6px 14px;
-      border-radius:5px; font-size:11px;
-      cursor:pointer; font-family:inherit;
-      transition:all .2s; display:none;
-      white-space:nowrap;
+    /* 底部状态 */
+    .footer {
+      background:#111; border-top:1px solid #1e1e1e;
+      padding:8px 16px;
+      display:flex; align-items:center; justify-content:space-between;
+      flex-shrink:0; font-size:11px; color:#555;
     }
-    .pause-btn:hover { background:rgba(255,152,0,.2); }
 
-    /* 中：大圆形录制按钮 */
-    .console-center { display:flex; flex-direction:column; align-items:center; gap:4px; flex-shrink:0; }
-    .big-btn {
-      width:56px; height:56px; border-radius:50%;
-      border:3px solid var(--red); background:transparent;
-      cursor:pointer; display:flex; align-items:center; justify-content:center;
-      transition:all .3s;
+    /* 提示框 */
+    .hint-box {
+      background:#161616; border:1px solid #2a2a2a;
+      border-radius:10px; padding:16px 24px;
+      text-align:center; max-width:400px;
     }
-    .big-btn:hover { box-shadow:0 0 22px rgba(229,57,53,.65); transform:scale(1.06); }
-    .big-inner {
-      width:26px; height:26px; border-radius:50%;
-      background:var(--red); transition:all .3s;
-    }
-    .big-btn.recording .big-inner { border-radius:5px; width:20px; height:20px; }
-    .big-btn.paused .big-inner {
-      background:var(--orange); border-radius:3px;
-      width:7px; height:22px; box-shadow:11px 0 0 var(--orange);
-    }
-    .btn-label { font-size:10px; color:var(--text-dim); text-align:center; }
+    .hint-box p { font-size:13px; color:#666; line-height:1.8; }
+    .hint-box strong { color:#bbb; }
 
-    /* 右：仪表盘 */
-    .console-right { flex-shrink:0; }
-    .dashboard {
-      background:var(--bg0); border:1px solid var(--border);
-      border-radius:8px; padding:7px 14px;
-      min-width:260px; font-family:'Courier New',monospace;
+    /* 错误条 */
+    .error-bar {
+      display:none; background:#2d1010;
+      border-bottom:1px solid #e53935;
+      padding:8px 16px; font-size:12px;
+      color:#ff8a80; flex-shrink:0;
     }
-    .dash-top {
-      display:flex; justify-content:space-between; align-items:center;
-      margin-bottom:5px;
-    }
-    .dash-timer { font-size:18px; font-weight:bold; color:#ff3b30; letter-spacing:2px; }
-    .dash-size  { font-size:13px; font-weight:bold; color:var(--text-main); }
-    .dash-bottom { display:flex; gap:14px; font-size:10px; color:var(--text-dim); flex-wrap:wrap; }
-    .dash-bottom b { color:var(--green); font-weight:bold; }
   </style>
 </head>
 <body>
 
   <!-- 标题栏 -->
-  <div class="title-bar">
-    <div class="title-left">
-      <div class="title-logo">🎬</div>
-      <div>
-        <div class="title-text">直播内录器 Pro</div>
-        <div class="title-sub" id="titleSub">Compositor-Level Capture · 纯净视频流</div>
-      </div>
-    </div>
-    <div style="display:flex;align-items:center;gap:10px;">
+  <div class="win-header">
+    <div class="win-title">
       <div class="rec-dot" id="recDot"></div>
-      <span id="titleStatus" style="font-size:12px;color:var(--text-dim);">就绪</span>
+      <span>🎬 直播内录器 Pro</span>
     </div>
+    <div class="win-subtitle">独占保活引擎 · 后台切页流畅不花屏</div>
   </div>
 
-  <!-- 错误条 -->
+  <!-- 错误提示 -->
   <div class="error-bar" id="errorBar"></div>
 
-  <!-- ★ R-02：视频预览区（tabCapture 流实时渲染） -->
-  <div class="preview-wrap">
-    <video id="previewPlayer" autoplay playsinline muted></video>
-
-    <!-- 空闲占位提示 -->
-    <div class="preview-overlay" id="idleOverlay">
-      <div class="idle-icon">🎥</div>
-      <div class="idle-text">
-        <strong>录制控制窗口已就绪</strong><br>
-        请将鼠标移至直播网页视频画面<br>
-        点击「⏺ 开始录制」按钮即可启动<br>
-        <span style="color:#333;font-size:11px;margin-top:6px;display:block;">
-          录制流为 Compositor 合成器级捕获 · 绝不卡顿
-        </span>
-      </div>
+  <!-- 状态横幅 -->
+  <div class="status-banner">
+    <div class="status-left">
+      <div class="status-indicator ready" id="statusDot"></div>
+      <span class="status-text" id="statusText">就绪 — 请在网页直播视频上点击「⏺ 开始录制」</span>
     </div>
-
-    <!-- 录制时间水印 -->
-    <div class="rec-watermark" id="recWatermark">00:00:00 · REC</div>
+    <div class="timer-display" id="timerDisplay">00:00:00</div>
   </div>
 
-  <!-- 底部控制台 -->
-  <div class="console">
+  <!-- 实时指标 -->
+  <div class="metrics-bar">
+    <div class="metric">📦 大小 <span class="metric-val hot" id="mSize">0 B</span></div>
+    <div class="metric">📡 速率 <span class="metric-val" id="mBitrate">0kbps</span></div>
+    <div class="metric">📺 分辨率 <span class="metric-val" id="mRes">-</span></div>
+    <div class="metric">🎞️ FPS <span class="metric-val" id="mFps">-</span></div>
+    <div class="metric">💾 格式 <span class="metric-val" id="mFormat">-</span></div>
+  </div>
 
-    <!-- 左：质量 + 暂停 -->
-    <div class="console-left">
-      <button class="q-btn uhd" id="wUHD">超清</button>
-      <button class="q-btn active" id="wHD">高清</button>
-      <button class="q-btn" id="wSD">标清</button>
-      <button class="pause-btn" id="wPause">⏸ 暂停</button>
+  <!-- 主控区 -->
+  <div class="main-section">
+
+    <!-- 实时画面预览（保活核心） -->
+    <div id="previewContainer">
+      <video id="previewPlayer" autoplay playsinline muted></video>
     </div>
 
-    <!-- 中：大按钮 -->
-    <div class="console-center">
-      <button class="big-btn" id="wRecBtn">
-        <div class="big-inner"></div>
-      </button>
-      <span class="btn-label" id="wBtnLabel">● 开始录制</span>
+    <div class="hint-box" id="hintBox">
+      <p>
+        <strong>📌 使用方式</strong><br>
+        将鼠标移至直播网页中的视频画面<br>
+        点击出现的 <strong>「⏺ 开始录制」</strong> 按钮<br>
+        录制即自动开始，此窗口同步进行静默保活并实时预览
+      </p>
     </div>
 
-    <!-- 右：仪表盘 -->
-    <div class="console-right">
-      <div class="dashboard">
-        <div class="dash-top">
-          <div class="dash-timer" id="wTimer">00:00:00</div>
-          <div class="dash-size"  id="wSize">0 B</div>
-        </div>
-        <div class="dash-bottom">
-          <span>CPU: <b id="wCpu">0%</b></span>
-          <span>FPS: <b id="wFps">-</b></span>
-          <span>码率: <b id="wBitrate">0kbps</b></span>
-          <span>分辨率: <b id="wRes">-</b></span>
-        </div>
+    <!-- 录制控制（录制中显示）-->
+    <div id="recControls" style="display:none; flex-direction:column; align-items:center; gap:20px;">
+      <div style="display:flex;flex-direction:column;align-items:center;gap:6px;">
+        <button class="big-rec-btn" id="bigRecBtn" title="停止录制">
+          <div class="big-rec-inner"></div>
+        </button>
+        <span class="rec-btn-label" id="bigRecLabel">点击停止</span>
+      </div>
+
+      <div class="sub-controls">
+        <button class="sub-btn warn" id="btnPause" disabled>⏸ 暂停</button>
+        <button class="sub-btn danger" id="btnStop">⏹ 停止并保存</button>
       </div>
     </div>
 
+    <!-- 质量选择 -->
+    <div class="quality-section">
+      <span class="q-label">录制质量：</span>
+      <button class="q-btn uhd" id="qUHD">超清 4K</button>
+      <button class="q-btn active" id="qHD">高清 1080P</button>
+      <button class="q-btn" id="qSD">标清 720P</button>
+    </div>
+
+  </div>
+
+  <!-- 底部 -->
+  <div class="footer">
+    <span>直播内录器 Pro v3.1 · 纯净视频流 + tabCapture 独占保活</span>
+    <span id="footerInfo">等待录制...</span>
   </div>
 
   <script src="recorder.js"></script>
