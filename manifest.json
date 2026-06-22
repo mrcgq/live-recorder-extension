@@ -7,6 +7,7 @@
     "activeTab",
     "storage",
     "downloads",
+    "tabCapture",  // 🆕 必须添加此项，开启高特权内录通道！
     "scripting",
     "tabs",
     "notifications"
