@@ -6,8 +6,7 @@
  * 物理职责：
  * 1. 建立 content_stream ↔ recorder_pipeline 的无损桥接通道
  * 2. 调度启动缓冲池，防止小窗初始化期间丢帧
- * 3. 监控网页端生命周期，意外断开时通知小窗紧急挽救落盘
- * 4. 执行安全下载与 Blob URL 的即时物理销毁
+ * 3. 监控网页端生命周期，意外断开时通知小窗紧急自愈
  */
 
 let recordingState = {
@@ -26,7 +25,7 @@ let recordingState = {
 let popupPort = null;
 let activeContentPort = null;
 let activeRecorderPort = null;
-let startupBuffer = []; // 启动缓冲池：暂存小窗打开前的数据片
+let startupBuffer = []; // 启动缓冲池
 
 // 跨进程 Port 通道桥接器
 chrome.runtime.onConnect.addListener((port) => {
@@ -50,7 +49,7 @@ chrome.runtime.onConnect.addListener((port) => {
     });
     port.onDisconnect.addListener(() => {
       activeContentPort = null;
-      // 物理崩溃探针：网页端长连接异常断开（如标签页 OOM），通知小窗紧急自愈
+      // 物理崩溃探针：长连接异常断开（如标签页 OOM），通知小窗紧急自愈
       if (activeRecorderPort) {
         activeRecorderPort.postMessage({ action: 'content_disconnected' });
       }
@@ -169,16 +168,6 @@ async function handlePopupCommand(msg) {
   }
 }
 
-function sanitizeFilename(raw) {
-  if (!raw || typeof raw !== 'string') return 'recording.webm';
-  return raw
-    .replace(/[/\\]/g, '_')
-    .replace(/\.\.+/g, '.')
-    .replace(/[\x00-\x1f\x7f]/g, '')
-    .replace(/^[.\s]+/, '')
-    .slice(0, 200) || 'recording.webm';
-}
-
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 
   if (req.action === 'metricsUpdate') {
@@ -213,45 +202,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     }
     sendResponse({ ok: true });
     return;
-  }
-
-  // 统一托管下载，严格闭环释放物理内存与本地磁盘缓存（Law-39）
-  if (req.action === 'triggerDownload') {
-    const safeName = sanitizeFilename(req.filename);
-    chrome.downloads.download({
-      url           : req.url,
-      filename      : safeName,
-      conflictAction: 'uniquify',
-      saveAs        : false,
-    }, (downloadId) => {
-      if (chrome.runtime.lastError) {
-        sendResponse({ error: chrome.runtime.lastError.message });
-        URL.revokeObjectURL(req.url);
-        return;
-      }
-      sendResponse({ downloadId });
-
-      function onChanged(delta) {
-        if (delta.id !== downloadId) return;
-        const st = delta.state && delta.state.current;
-        if (st === 'complete' || st === 'interrupted') {
-          chrome.downloads.onChanged.removeListener(onChanged);
-          // 广播释放消息至小窗，强制执行内存 URL 吊销与 OPFS 临时磁盘缓存完全擦除
-          chrome.runtime.sendMessage(
-            { _target: 'recorder', action: 'releaseBlobUrl', url: req.url }
-          ).catch(() => {});
-          if (recordingState.activeTabId) {
-            chrome.tabs.sendMessage(
-              recordingState.activeTabId,
-              { action: 'releaseBlobUrl', url: req.url },
-              () => { void chrome.runtime.lastError; }
-            );
-          }
-        }
-      }
-      chrome.downloads.onChanged.addListener(onChanged);
-    });
-    return true;
   }
 
   if (req.action === 'startRecordFromContent') {
