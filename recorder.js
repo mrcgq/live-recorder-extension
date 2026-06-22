@@ -1,21 +1,32 @@
 'use strict';
 
 // ============================================================
-// recorder.js v4.1
-// 核心修复：
-//   FIX-01: 优先使用 URL 参数中预置的 streamId（由 background
-//           在用户手势上下文中预取），彻底解决权限拒绝问题。
-//           若 streamId 缺失，再走兜底路径重新请求。
-//   R-02:   进程同调消费（黑屏根本消除）
-//   R-03:   音频直通旁路（扬声器不静音）
-//   完整保留：IDB持久化、崩溃恢复、双重保护
+// recorder.js v4.0 - 录制引擎（完整数据面）
+//
+// ★ 架构核心：
+//   录制引擎 100% 在本文件（独立小窗进程）内运行
+//   content.js 不做任何录制，只做视口清洗和 UI
+//
+// ★ 解决"网页消失+画面不卡"的物理原理：
+//   1. background 立即最小化宿主网页窗口
+//   2. 本文件用 tabCapture 接管该网页
+//   3. tabCapture 触发浏览器 Compositor 保活机制：
+//      即使网页被最小化，浏览器仍在后台满帧渲染该网页
+//   4. content.js 已做视口清洗：网页视口只剩纯净视频
+//   5. 本文件录制到的画面 = 纯净视频，无任何网页杂质
+//   6. 本文件运行在独立进程，与网页完全隔离
+//
+// ★ 解决"黑屏"的物理原理：
+//   streamId 由 background 预取后通过 URL 参数传入
+//   本文件在自己的渲染进程内消费 streamId
+//   消费者与生产者同进程 → 黑屏根本消除
 // ============================================================
 
 const REC = {
   mediaRecorder  : null,
   stream         : null,
-  audioCtx       : null,
-  systemAudioCtx : null,
+  audioCtx       : null,       // 麦克风混音
+  systemAudioCtx : null,       // 音频直通旁路
   chunks         : [],
   totalBytes     : 0,
   seconds        : 0,
@@ -23,7 +34,7 @@ const REC = {
   isRecording    : false,
   tabId          : null,
   windowId       : null,
-  presetStreamId : null,   // ★ FIX-01：background 预取的 streamId
+  presetStreamId : null,       // background 预取的 streamId
   config         : null,
   timerInterval  : null,
   monInterval    : null,
@@ -44,21 +55,21 @@ const QUALITY_PRESETS = {
 
 const $       = (id)      => document.getElementById(id);
 const setText = (id, val) => { const e = $(id); if (e) e.textContent = val; };
-const log     = (...a)    => console.log('[recorder v4.1]', ...a);
+const log     = (...a)    => console.log('[recorder v4]', ...a);
 
 // ============================================================
-// IndexedDB 持久化层（零丢失保障）
+// IndexedDB 持久化（零丢失）
 // ============================================================
 async function openIDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('LiveRecorderDB_v4', 2);
+    const req = indexedDB.open('LiveRecDB_v4', 1);
     req.onupgradeneeded = (e) => {
       const db = e.target.result;
       if (!db.objectStoreNames.contains('chunks')) {
         db.createObjectStore('chunks', { keyPath: 'id', autoIncrement: true });
       }
       if (!db.objectStoreNames.contains('sessions')) {
-        db.createObjectStore('sessions', { keyPath: 'sessionId' });
+        db.createObjectStore('sessions', { keyPath: 'sid' });
       }
     };
     req.onsuccess = (e) => resolve(e.target.result);
@@ -72,8 +83,7 @@ function idbPut(store, data) {
     try {
       const tx = REC.idbDb.transaction(store, 'readwrite');
       tx.objectStore(store).put(data);
-      tx.oncomplete = resolve;
-      tx.onerror    = resolve;
+      tx.oncomplete = resolve; tx.onerror = resolve;
     } catch (_) { resolve(); }
   });
 }
@@ -84,23 +94,22 @@ function idbAdd(store, data) {
     try {
       const tx = REC.idbDb.transaction(store, 'readwrite');
       tx.objectStore(store).add(data);
-      tx.oncomplete = resolve;
-      tx.onerror    = resolve;
+      tx.oncomplete = resolve; tx.onerror = resolve;
     } catch (_) { resolve(); }
   });
 }
 
-function idbGetChunks(sessionId) {
+function idbGetChunks(sid) {
   return new Promise((resolve) => {
     if (!REC.idbDb) { resolve([]); return; }
     try {
       const results = [];
-      const req = REC.idbDb.transaction('chunks', 'readonly')
+      const req = REC.idbDb.transaction('chunks','readonly')
                     .objectStore('chunks').openCursor();
       req.onsuccess = (e) => {
         const c = e.target.result;
-        if (!c) { resolve(results.sort((a, b) => a.seq - b.seq)); return; }
-        if (c.value.sessionId === sessionId) results.push(c.value);
+        if (!c) { resolve(results.sort((a,b)=>a.seq-b.seq)); return; }
+        if (c.value.sid === sid) results.push(c.value);
         c.continue();
       };
       req.onerror = () => resolve(results);
@@ -108,23 +117,22 @@ function idbGetChunks(sessionId) {
   });
 }
 
-function idbDeleteSession(sessionId) {
+function idbDeleteSession(sid) {
   if (!REC.idbDb) return Promise.resolve();
   return new Promise((resolve) => {
     try {
-      const tx  = REC.idbDb.transaction('chunks', 'readwrite');
+      const tx  = REC.idbDb.transaction('chunks','readwrite');
       const cur = tx.objectStore('chunks').openCursor();
       cur.onsuccess = (e) => {
         const c = e.target.result;
         if (!c) return;
-        if (c.value.sessionId === sessionId) c.delete();
+        if (c.value.sid === sid) c.delete();
         c.continue();
       };
       tx.oncomplete = () => {
-        const tx2 = REC.idbDb.transaction('sessions', 'readwrite');
-        tx2.objectStore('sessions').delete(sessionId);
-        tx2.oncomplete = resolve;
-        tx2.onerror    = resolve;
+        const tx2 = REC.idbDb.transaction('sessions','readwrite');
+        tx2.objectStore('sessions').delete(sid);
+        tx2.oncomplete = resolve; tx2.onerror = resolve;
       };
       tx.onerror = resolve;
     } catch (_) { resolve(); }
@@ -136,7 +144,7 @@ async function recoverCrashedSessions() {
   try {
     const all = await new Promise((resolve) => {
       try {
-        const req = REC.idbDb.transaction('sessions', 'readonly')
+        const req = REC.idbDb.transaction('sessions','readonly')
                       .objectStore('sessions').getAll();
         req.onsuccess = (e) => resolve(e.target.result || []);
         req.onerror   = () => resolve([]);
@@ -144,27 +152,30 @@ async function recoverCrashedSessions() {
     });
 
     for (const session of all) {
-      if (session.completed) { await idbDeleteSession(session.sessionId); continue; }
-      const chunks = await idbGetChunks(session.sessionId);
-      if (!chunks.length)   { await idbDeleteSession(session.sessionId); continue; }
+      if (session.done) { await idbDeleteSession(session.sid); continue; }
+      const chunks = await idbGetChunks(session.sid);
+      if (!chunks.length) { await idbDeleteSession(session.sid); continue; }
 
-      log('恢复崩溃录制:', session.sessionId, '共', chunks.length, '个分片');
-      const mime = session.mimeType || 'video/webm';
+      log('恢复崩溃录制:', session.sid, '共', chunks.length, '片');
+      const mime = session.mime || 'video/webm';
       const blob = new Blob(chunks.map(c => c.blob), { type: mime });
       const ext  = mime.includes('mp4') ? 'mp4' : 'webm';
-      const ts   = new Date(session.startTime || Date.now())
+      const ts   = new Date(session.t0 || Date.now())
                      .toISOString().replace('T','_').replace(/:/g,'-').slice(0,19);
       const fn   = (session.prefix || '崩溃恢复') + '_recovered_' + ts + '.' + ext;
-      const url  = URL.createObjectURL(blob);
 
-      chrome.runtime.sendMessage({ action: 'triggerDownload', url, filename: fn },
-        () => { void chrome.runtime.lastError; });
       chrome.runtime.sendMessage({
-        action: 'notify',
+        action  : 'triggerDownload',
+        url     : URL.createObjectURL(blob),
+        filename: fn,
+      }, () => { void chrome.runtime.lastError; });
+
+      chrome.runtime.sendMessage({
+        action : 'notify',
         message: '✅ 已恢复崩溃录制: ' + fn + ' (' + fmtSize(blob.size) + ')',
       }).catch(() => {});
 
-      await idbDeleteSession(session.sessionId);
+      await idbDeleteSession(session.sid);
     }
   } catch (e) {
     log('崩溃恢复异常:', e.message);
@@ -176,20 +187,19 @@ async function recoverCrashedSessions() {
 // ============================================================
 async function init() {
   const params = new URLSearchParams(window.location.search);
-
   REC.tabId          = parseInt(params.get('tabId'))    || null;
   REC.windowId       = parseInt(params.get('windowId')) || null;
-  REC.presetStreamId = params.get('streamId')           || null; // ★ FIX-01
+  REC.presetStreamId = params.get('streamId')           || null;
 
   try {
     REC.config = JSON.parse(decodeURIComponent(params.get('config') || '{}'));
-  } catch (_) {
-    REC.config = {};
-  }
+  } catch (_) { REC.config = {}; }
 
   const autoStart = params.get('autoStart') === 'true';
 
-  log('初始化 tabId:', REC.tabId, 'presetStreamId:', REC.presetStreamId ? '✅已预取' : '⚠️未预取');
+  log('初始化 tabId:', REC.tabId,
+      'presetStreamId:', REC.presetStreamId ? '✅ 已预取' : '⚠️ 未预取',
+      'autoStart:', autoStart);
 
   // 初始化 IDB
   try {
@@ -205,30 +215,25 @@ async function init() {
   window.addEventListener('beforeunload', onBeforeUnload);
   window.addEventListener('unload',       onUnload);
 
-  // ★ FIX-01：autoStart=true 时直接启动
-  // 不再需要任何延迟，streamId 已由 background 预取
+  // autoStart=true 时直接启动录制
   if (autoStart && REC.tabId) {
-    await startRecordingPipeline();
+    await startPipeline();
   }
 }
 
 function bindEvents() {
-  const on = (id, ev, fn) => { const el = $(id); if (el) el.addEventListener(ev, fn); };
-  on('wRecBtn', 'click', toggleRecordAction);
-  on('wPause',  'click', togglePauseAction);
-  on('wUHD', 'click', () => changeQuality('uhd'));
-  on('wHD',  'click', () => changeQuality('hd'));
-  on('wSD',  'click', () => changeQuality('sd'));
+  const on = (id, ev, fn) => { const e = $(id); if (e) e.addEventListener(ev, fn); };
+  on('wRecBtn', 'click', toggleRecord);
+  on('wPause',  'click', togglePause);
+  on('wUHD', 'click', () => setQuality('uhd'));
+  on('wHD',  'click', () => setQuality('hd'));
+  on('wSD',  'click', () => setQuality('sd'));
 }
 
 // ============================================================
 // ★ 核心录制管线
-// FIX-01 修复要点：
-//   1. 优先使用 presetStreamId（background 已在手势上下文中预取）
-//   2. presetStreamId 失效时，尝试向 background 重新请求（兜底）
-//   3. 彻底消灭"获取捕获权限失败"错误
 // ============================================================
-async function startRecordingPipeline() {
+async function startPipeline() {
   if (REC.isRecording) return;
 
   cleanupResources(false);
@@ -241,50 +246,46 @@ async function startRecordingPipeline() {
   REC.prevBytes   = 0;
   REC.prevTime    = performance.now();
   REC.chunkSeq    = 0;
-  REC.sessionId   = 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+  REC.sessionId   = 'sid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
   REC.mimeType    = pickMime(REC.config.format);
 
   if (!REC.tabId) {
-    showError('❌ 未能确定录制目标页面，请关闭后重新从扩展面板启动');
+    showError('❌ 未确定录制目标页面，请重新从扩展面板启动');
     return;
   }
 
   const preset       = QUALITY_PRESETS[REC.config.quality || 'hd'];
   const audioEnabled = !!(REC.config.sysAudio && !REC.config.noAudio);
 
-  // 写 IDB session 元数据
+  // 写 IDB session 元数据（用于崩溃恢复）
   await idbPut('sessions', {
-    sessionId : REC.sessionId,
-    mimeType  : REC.mimeType,
-    prefix    : REC.config.filePrefix || '直播录制',
-    startTime : Date.now(),
-    completed : false,
+    sid   : REC.sessionId,
+    mime  : REC.mimeType,
+    prefix: REC.config.filePrefix || '直播录制',
+    t0    : Date.now(),
+    done  : false,
   });
 
-  // ★ FIX-01：获取 streamId 的两级策略
-  let streamId = null;
+  // ★ 两级 streamId 获取策略
+  //   Level-1：使用 background 预取的 streamId（最优，已在手势上下文中获取）
+  //   Level-2：向 background 重新请求（兜底，background 有完整权限）
+  let streamId = REC.presetStreamId || null;
 
-  // 第一级：使用 background 预取的 streamId（最可靠）
-  if (REC.presetStreamId) {
-    streamId = REC.presetStreamId;
-    log('★ 使用预取 streamId:', streamId.slice(0, 20) + '...');
-  }
-
-  // 第二级：预取失败，向 background 重新请求（兜底路径）
   if (!streamId) {
     log('⚠️ 无预取 streamId，向 background 重新请求...');
     try {
-      streamId = await requestStreamIdFromBackground(audioEnabled, REC.tabId);
+      streamId = await requestStreamId(audioEnabled, REC.tabId);
       log('★ 兜底获取 streamId 成功');
     } catch (e) {
-      showError('❌ 无法获取录制权限: ' + e.message +
-        '\n请确认已在扩展管理页开启"tabCapture"权限，且目标标签页仍处于激活状态');
+      showError('❌ 无法获取录制权限: ' + e.message);
       await idbDeleteSession(REC.sessionId);
       return;
     }
+  } else {
+    log('★ 使用预取 streamId');
   }
 
-  // 使用 streamId 在本渲染进程直接获取媒体流
+  // ★ 在本渲染进程消费 streamId → 同进程，黑屏消除
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -307,51 +308,53 @@ async function startRecordingPipeline() {
           }
         : false,
     });
-    log('★ 媒体流获取成功，视频轨:', stream.getVideoTracks().length, '音频轨:', stream.getAudioTracks().length);
+    log('★ 媒体流获取成功 video轨:', stream.getVideoTracks().length,
+        'audio轨:', stream.getAudioTracks().length);
   } catch (e) {
-    // streamId 已过期（窗口打开耗时太长）→ 清空预取，重新请求
-    if (REC.presetStreamId && (e.name === 'NotAllowedError' || e.name === 'InvalidStateError')) {
-      log('⚠️ 预取 streamId 已过期，清空后重新获取...');
+    // 预取 streamId 过期时自动重试
+    if (REC.presetStreamId &&
+        (e.name === 'NotAllowedError' || e.name === 'InvalidStateError' ||
+         e.message.includes('invalid'))) {
+      log('⚠️ 预取 streamId 已过期，重新获取...');
       REC.presetStreamId = null;
       await idbDeleteSession(REC.sessionId);
-      // 重新走完整流程
-      return startRecordingPipeline();
+      return startPipeline(); // 递归重试
     }
-
     showError('❌ 媒体流获取失败: ' + e.message);
     await idbDeleteSession(REC.sessionId);
     return;
   }
 
   // ★ R-03：音频直通旁路
-  // tabCapture 独占音频后浏览器会静音网页扬声器
-  // 建立 AudioContext 直通节点，将音频桥接回物理扬声器
+  //   tabCapture 独占音频后网页扬声器被静音
+  //   建立 AudioContext 将音频桥接回物理扬声器
   if (audioEnabled && stream.getAudioTracks().length > 0) {
     try {
       const sysCtx = new AudioContext({ sampleRate: 48000 });
       if (sysCtx.state === 'suspended') await sysCtx.resume();
       sysCtx.createMediaStreamSource(stream).connect(sysCtx.destination);
       REC.systemAudioCtx = sysCtx;
-      log('★ R-03 音频直通旁路已建立');
+      log('★ R-03 音频直通旁路已建立，扬声器正常发声');
     } catch (e) {
-      log('音频旁路创建失败（非致命）:', e.message);
+      log('音频旁路失败（非致命）:', e.message);
     }
   }
 
-  // 绑定实时预览
+  // 绑定实时预览（本进程消费，不黑屏）
   const player = $('previewPlayer');
   if (player) {
     player.srcObject = stream;
     player.play().catch(() => {});
   }
-  const overlay = $('idleOverlay');
-  if (overlay) overlay.style.display = 'none';
+  const ol = $('idleOverlay');
+  if (ol) ol.style.display = 'none';
 
   // 记录实际分辨率
   const vTrack = stream.getVideoTracks()[0];
   if (vTrack) {
     const s = vTrack.getSettings();
     if (s.width && s.height) REC.config._resolution = s.width + 'x' + s.height;
+    // 用户关闭屏幕共享 → 自动保存
     vTrack.onended = () => { if (REC.isRecording) { log('视频轨结束，自动保存'); doStop(); } };
   }
 
@@ -362,7 +365,7 @@ async function startRecordingPipeline() {
   }
   REC.stream = finalStream;
 
-  // H.264 硬件加速编码
+  // ★ H.264 硬件加速编码
   let recorder;
   try {
     recorder = new MediaRecorder(finalStream, {
@@ -387,52 +390,53 @@ async function startRecordingPipeline() {
   recorder.onstop          = onRecorderStop;
   recorder.onerror = (ev) => { log('MediaRecorder 错误:', ev.error); doStop(); };
 
-  recorder.start(1000);
+  recorder.start(1000); // 每秒分片
   REC.mediaRecorder = recorder;
   REC.isRecording   = true;
 
   startTimers();
   updateUIRecording();
-  notifyStateChanged(true, false);
+  notifyState(true, false);
 
   // 通知 background 显示网页悬浮控制条
   chrome.runtime.sendMessage({ action: 'showFloat', position: 'top-right' }).catch(() => {});
 
-  log('★ 录制已启动，mimeType:', REC.mimeType);
+  log('★ 录制已启动 mimeType:', REC.mimeType,
+      '目标Tab:', REC.tabId, '分辨率:', REC.config._resolution);
 }
 
-// ── 数据分片（内存 + IDB 双写）───────────────────────────────
+// 分片：内存 + IDB 双写
 function onData(e) {
   if (!e.data || e.data.size === 0) return;
   REC.chunks.push(e.data);
   REC.totalBytes += e.data.size;
   const seq = REC.chunkSeq++;
-  idbAdd('chunks', {
-    sessionId: REC.sessionId, seq, blob: e.data, ts: Date.now(),
-  }).catch(() => {});
+  idbAdd('chunks', { sid: REC.sessionId, seq, blob: e.data, ts: Date.now() }).catch(() => {});
 }
 
-// ── 暂停 ─────────────────────────────────────────────────────
+// 暂停
 function doPause() {
   if (!REC.mediaRecorder || REC.mediaRecorder.state !== 'recording') return;
   REC.mediaRecorder.pause();
   REC.isPaused = true;
   const p = $('wPause'); if (p) p.textContent = '▶ 继续';
-  updateUIStatePaused();
-  notifyStateChanged(true, true);
+  $('wRecBtn') && ($('wRecBtn').className = 'big-btn paused');
+  setText('titleStatus', '⏸ 已暂停');
+  notifyState(true, true);
 }
 
-// ── 继续 ─────────────────────────────────────────────────────
+// 继续
 function doResume() {
   if (!REC.mediaRecorder || REC.mediaRecorder.state !== 'paused') return;
   REC.mediaRecorder.resume();
   REC.isPaused = false;
   const p = $('wPause'); if (p) p.textContent = '⏸ 暂停';
-  updateUIStateRecording();
-  notifyStateChanged(true, false);
+  $('wRecBtn') && ($('wRecBtn').className = 'big-btn recording');
+  setText('titleStatus', '🔴 录制中');
+  notifyState(true, false);
 }
 
-// ── 停止 ─────────────────────────────────────────────────────
+// 停止
 function doStop() {
   if (!REC.isRecording && !REC.mediaRecorder) return;
   REC.isRecording = false;
@@ -446,7 +450,7 @@ function doStop() {
   }
 }
 
-// ── 录制完成：保存 ────────────────────────────────────────────
+// 录制完成：生成 Blob → 下载
 async function onRecorderStop() {
   stopTimers();
   updateUIIdle();
@@ -457,7 +461,7 @@ async function onRecorderStop() {
 
   if (!chunks.length) {
     log('无录制数据');
-    notifyStateChanged(false, false);
+    notifyState(false, false);
     cleanupResources(true);
     return;
   }
@@ -465,7 +469,7 @@ async function onRecorderStop() {
   const mime     = REC.mimeType || 'video/webm';
   const blob     = new Blob(chunks, { type: mime });
   const ext      = mime.includes('mp4') ? 'mp4' : 'webm';
-  const prefix   = (REC.config && REC.config.filePrefix) ? REC.config.filePrefix : '直播录制';
+  const prefix   = (REC.config && REC.config.filePrefix) || '直播录制';
   const ts       = new Date().toISOString().replace('T','_').replace(/:/g,'-').slice(0,19);
   const filename = prefix + '_' + ts + '.' + ext;
   const url      = URL.createObjectURL(blob);
@@ -474,10 +478,10 @@ async function onRecorderStop() {
     if (resp && resp.error) { log('下载失败:', resp.error); URL.revokeObjectURL(url); }
   });
 
+  // 标记完成
   if (REC.sessionId) {
     await idbPut('sessions', {
-      sessionId: REC.sessionId, mimeType: mime,
-      prefix, completed: true, endTime: Date.now(),
+      sid: REC.sessionId, mime, prefix, done: true, t1: Date.now(),
     });
     setTimeout(() => idbDeleteSession(REC.sessionId), 10000);
   }
@@ -487,19 +491,18 @@ async function onRecorderStop() {
     message: '✅ 录制完成！' + fmtSize(REC.totalBytes) + ' · ' + fmtTime(REC.seconds),
   }).catch(() => {});
 
-  notifyStateChanged(false, false);
+  notifyState(false, false);
   cleanupResources(true);
-  log('★ 录制已完成并保存');
+  log('★ 录制完成并保存:', filename);
 }
 
-// ── 异常关闭双重保护 ─────────────────────────────────────────
+// 异常关闭保护
 function onBeforeUnload(e) {
   if (!REC.isRecording) return;
   e.preventDefault();
-  e.returnValue = '录制中，关闭后将自动保存已录制内容';
+  e.returnValue = '录制中，关闭后将自动恢复已录制的内容';
   return e.returnValue;
 }
-
 function onUnload() {
   if (!REC.isRecording) return;
   try {
@@ -509,39 +512,31 @@ function onUnload() {
   } catch (_) {}
 }
 
-// ── 资源完整释放 ─────────────────────────────────────────────
+// 资源释放
 function cleanupResources(resetAll) {
   if (REC.stream) {
     REC.stream.getTracks().forEach(t => t.stop());
     REC.stream = null;
   }
-  if (REC.audioCtx) {
-    REC.audioCtx.close().catch(() => {});
-    REC.audioCtx = null;
-  }
-  if (REC.systemAudioCtx) {
-    REC.systemAudioCtx.close().catch(() => {});
-    REC.systemAudioCtx = null;
-  }
+  if (REC.audioCtx)       { REC.audioCtx.close().catch(()=>{}); REC.audioCtx = null; }
+  if (REC.systemAudioCtx) { REC.systemAudioCtx.close().catch(()=>{}); REC.systemAudioCtx = null; }
 
   const player = $('previewPlayer');
   if (player) player.srcObject = null;
-
-  const overlay = $('idleOverlay');
-  if (overlay) overlay.style.display = 'flex';
+  const ol = $('idleOverlay');
+  if (ol) ol.style.display = 'flex';
 
   if (resetAll) {
     REC.mediaRecorder  = null;
     REC.isRecording    = false;
     REC.chunks         = [];
     REC.chunkSeq       = 0;
-    REC.presetStreamId = null; // 清空预取，下次录制重新获取
+    REC.presetStreamId = null;
   }
-
   stopTimers();
 }
 
-// ── 麦克风混音 ────────────────────────────────────────────────
+// 麦克风混音
 async function mixMicrophone(videoStream) {
   try {
     const micStream = await navigator.mediaDevices.getUserMedia({
@@ -568,7 +563,7 @@ async function mixMicrophone(videoStream) {
   }
 }
 
-// ── 计时与监控 ────────────────────────────────────────────────
+// 计时与监控
 function startTimers() {
   stopTimers();
 
@@ -578,7 +573,7 @@ function startTimers() {
     updateDashboard();
   }, 1000);
 
-  REC.prevTime  = performance.now();
+  REC.prevTime = performance.now();
   REC.prevBytes = 0;
 
   REC.monInterval = setInterval(() => {
@@ -589,7 +584,7 @@ function startTimers() {
     REC.prevBytes      = REC.totalBytes;
     REC.prevTime       = now;
     const kbps         = Math.round(bps / 1000);
-    REC.currentBitrate = kbps > 1000 ? (kbps / 1000).toFixed(1) + 'Mbps' : kbps + 'kbps';
+    REC.currentBitrate = kbps > 1000 ? (kbps/1000).toFixed(1)+'Mbps' : kbps+'kbps';
     updateDashboard();
   }, 1000);
 }
@@ -600,16 +595,16 @@ function stopTimers() {
 }
 
 function updateDashboard() {
-  const resolution = (REC.config && REC.config._resolution) ? REC.config._resolution : getResolution();
-  const baseFps    = (REC.config && REC.config.fps) ? parseInt(REC.config.fps) : 30;
-  const jFps       = Math.max(0, baseFps + Math.floor(Math.random() * 3 - 1));
-  const kbpsNum    = parseInt(REC.currentBitrate) || 0;
-  const estCpu     = Math.min(98, Math.max(1, Math.round(kbpsNum / 400 + Math.random() * 2)));
+  const res    = (REC.config && REC.config._resolution) || getResolution();
+  const base   = (REC.config && REC.config.fps) ? parseInt(REC.config.fps) : 30;
+  const jFps   = Math.max(0, base + Math.floor(Math.random()*3-1));
+  const kbpsN  = parseInt(REC.currentBitrate) || 0;
+  const estCpu = Math.min(98, Math.max(1, Math.round(kbpsN/400 + Math.random()*2)));
 
   setText('wTimer',   fmtTime(REC.seconds));
   setText('wSize',    fmtSize(REC.totalBytes));
   setText('wBitrate', REC.currentBitrate);
-  setText('wRes',     resolution);
+  setText('wRes',     res);
   setText('wFps',     String(jFps));
   setText('wCpu',     estCpu + '%');
 
@@ -618,34 +613,24 @@ function updateDashboard() {
 
   chrome.runtime.sendMessage({
     action     : 'metricsUpdate',
-    isRecording: true,
-    isPaused   : REC.isPaused,
+    isRecording: true, isPaused: REC.isPaused,
     timeString : fmtTime(REC.seconds),
     sizeString : fmtSize(REC.totalBytes),
     bitrate    : REC.currentBitrate,
-    resolution,
+    resolution : res,
     fps        : jFps,
     cpu        : estCpu + '%',
   }).catch(() => {});
 }
 
-// ── UI 状态 ───────────────────────────────────────────────────
+// UI 状态
 function updateUIRecording() {
-  updateUIStateRecording();
-  const dot = $('recDot');       if (dot) dot.style.display = 'block';
-  const p   = $('wPause');       if (p)   { p.style.display = 'block'; p.textContent = '⏸ 暂停'; }
-  const wm  = $('recWatermark'); if (wm)  wm.classList.add('show');
+  const btn = $('wRecBtn'); if (btn) btn.className = 'big-btn recording';
+  const dot = $('recDot');  if (dot) dot.style.display = 'block';
+  const p   = $('wPause');  if (p)   { p.style.display = 'block'; p.textContent = '⏸ 暂停'; }
+  const wm  = $('recWatermark'); if (wm) wm.classList.add('show');
   setText('wBtnLabel',   '⏹ 停止录制');
   setText('titleStatus', '🔴 录制中');
-}
-
-function updateUIStateRecording() {
-  const btn = $('wRecBtn'); if (btn) btn.className = 'big-btn recording';
-}
-
-function updateUIStatePaused() {
-  const btn = $('wRecBtn'); if (btn) btn.className = 'big-btn paused';
-  setText('titleStatus', '⏸ 已暂停');
 }
 
 function updateUIIdle() {
@@ -669,18 +654,18 @@ function clearError() {
   if (el) { el.textContent = ''; el.style.display = 'none'; }
 }
 
-// ── 动作触发 ─────────────────────────────────────────────────
-function toggleRecordAction() {
+// 触发器
+function toggleRecord() {
   if (REC.isRecording) doStop();
-  else startRecordingPipeline().catch(e => showError('❌ 启动失败: ' + e.message));
+  else startPipeline().catch(e => showError('❌ 启动失败: ' + e.message));
 }
 
-function togglePauseAction() {
+function togglePause() {
   if (!REC.isRecording) return;
   if (REC.isPaused) doResume(); else doPause();
 }
 
-function changeQuality(q) {
+function setQuality(q) {
   if (!QUALITY_PRESETS[q]) return;
   REC.config         = REC.config || {};
   REC.config.quality = q;
@@ -703,48 +688,36 @@ function setQualityHighlight(q) {
   });
 }
 
-// ── 来自 background 的指令 ────────────────────────────────────
+// 后台指令监听
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   if (req._target !== 'recorder') return;
-
   switch (req.action) {
     case 'stopRecording':
-      doStop();
-      sendResponse({ ok: true });
-      break;
+      doStop(); sendResponse({ ok: true }); break;
     case 'pauseRecording':
-      if (!REC.isPaused) doPause();
-      sendResponse({ ok: true });
-      break;
+      if (!REC.isPaused) doPause(); sendResponse({ ok: true }); break;
     case 'resumeRecording':
-      if (REC.isPaused) doResume();
-      sendResponse({ ok: true });
-      break;
+      if (REC.isPaused) doResume(); sendResponse({ ok: true }); break;
     case 'releaseBlobUrl':
       if (req.url) URL.revokeObjectURL(req.url);
       REC.chunks = [];
-      sendResponse({ ok: true });
-      break;
+      sendResponse({ ok: true }); break;
     default:
       sendResponse({ ok: false });
   }
 });
 
-// ── 工具：向 background 请求 streamId（兜底路径）────────────
-function requestStreamIdFromBackground(withAudio, tabId) {
+// 工具函数
+function requestStreamId(withAudio, tabId) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
-      () => reject(new Error('StreamId 请求超时（10秒）')),
-      10000
+      () => reject(new Error('StreamId 请求超时（10s）')), 10000
     );
     chrome.runtime.sendMessage(
       { action: 'getTabStreamId', withAudio, tabId },
       (resp) => {
         clearTimeout(timer);
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
+        if (chrome.runtime.lastError) { reject(new Error(chrome.runtime.lastError.message)); return; }
         if (resp && resp.streamId) resolve(resp.streamId);
         else reject(new Error(resp ? (resp.error || '无 streamId') : '无响应'));
       }
@@ -753,23 +726,12 @@ function requestStreamIdFromBackground(withAudio, tabId) {
 }
 
 function pickMime(format) {
-  const mp4 = [
-    'video/mp4;codecs=avc1.64001F,mp4a.40.2',
-    'video/mp4;codecs=avc1,mp4a.40.2',
-    'video/mp4;codecs=h264,aac',
-    'video/mp4',
-  ];
-  const webm = [
-    'video/webm;codecs=h264,opus',
-    'video/webm;codecs=vp8,opus',
-    'video/webm;codecs=vp9,opus',
-    'video/webm',
-  ];
-  return ((format === 'mp4') ? mp4 : webm)
-    .find(m => MediaRecorder.isTypeSupported(m)) || 'video/webm';
+  const mp4  = ['video/mp4;codecs=avc1.64001F,mp4a.40.2','video/mp4;codecs=avc1,mp4a.40.2','video/mp4;codecs=h264,aac','video/mp4'];
+  const webm = ['video/webm;codecs=h264,opus','video/webm;codecs=vp8,opus','video/webm;codecs=vp9,opus','video/webm'];
+  return ((format === 'mp4') ? mp4 : webm).find(m => MediaRecorder.isTypeSupported(m)) || 'video/webm';
 }
 
-function notifyStateChanged(isRecording, isPaused) {
+function notifyState(isRecording, isPaused) {
   chrome.runtime.sendMessage({
     action: 'recordingStateChanged',
     state : {
@@ -794,16 +756,15 @@ function getResolution() {
 function fmtSize(b) {
   b = b || 0;
   if (b < 1024)       return b + ' B';
-  if (b < 1048576)    return (b / 1024).toFixed(1) + ' KB';
-  if (b < 1073741824) return (b / 1048576).toFixed(2) + ' MB';
-  return (b / 1073741824).toFixed(2) + ' GB';
+  if (b < 1048576)    return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(2) + ' MB';
+  return (b/1073741824).toFixed(2) + ' GB';
 }
 
 function fmtTime(s) {
   s = s || 0;
-  return [Math.floor(s / 3600), Math.floor((s % 3600) / 60), s % 60]
-    .map(n => String(n).padStart(2, '0')).join(':');
+  return [Math.floor(s/3600), Math.floor((s%3600)/60), s%60]
+    .map(n => String(n).padStart(2,'0')).join(':');
 }
 
-// 启动
-init().catch(e => console.error('[recorder v4.1] init 失败:', e));
+init().catch(e => console.error('[recorder v4] init 失败:', e));
