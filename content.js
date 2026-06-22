@@ -1,39 +1,23 @@
 'use strict';
 
 // ============================================================
-// content.js v4.0 - 纯 UI 层（数据面已完全迁出）
-//
-// 职责（仅限于此，不做任何录制）：
-//   1. Shadow DOM 穿透，识别直播视频，显示悬浮录制栏
-//   2. 视口清洗划界（applyViewportSanitize）
-//      将目标视频强制铺满全屏，过滤弹幕/广告
-//      tabCapture 捕获的 Tab 画面因此只含纯净视频
-//   3. 网页悬浮录制控制条（showFloat / updateFloat）
-//   4. 转发用户操作指令给 background/recorder
-//
-// 不在此处做的事（已迁回 recorder.js）：
-//   ✗ MediaRecorder
-//   ✗ captureStream()
-//   ✗ getUserMedia()
-//   ✗ AudioContext 录制
+// content.js v4.1 - DOM 树隔离与视口超纯净清洗
 // ============================================================
 
-// ── 状态 ─────────────────────────────────────────────────────
 const CS = {
-  hoverVideo     : null,
-  hoverBar       : null,
-  hoverRAF       : null,
-  leaveTimer     : null,
-  floatBar       : null,
-  floatTimer     : null,
-  floatSec       : 0,
-  floatPaused    : false,
-  regionActive   : false,
-  observer       : null,
-  bindTimeout    : null,
-  sanitizedVideo : null,   // 当前被清洗的视频元素
-  sanitizeStyle  : null,   // 注入的清洗样式
-  origStyle      : null,   // 视频原始 style 备份
+  hoverVideo       : null,
+  hoverBar         : null,
+  hoverRAF         : null,
+  leaveTimer       : null,
+  floatBar         : null,
+  floatTimer       : null,
+  floatSec         : 0,
+  floatPaused      : false,
+  regionActive     : false,
+  observer         : null,
+  bindTimeout      : null,
+  sanitizedVideo   : null,   // 当前被隔离清洗的视频元素
+  isolatedElements : [],     // 用于完美回滚布局的 DOM 状态备份数组
 };
 
 function fmtTime(s) {
@@ -43,85 +27,195 @@ function fmtTime(s) {
 }
 
 // ============================================================
-// ★ 视口清洗划界（R-01）
-// 将目标视频强制 fixed 满屏，遮挡弹幕/广告/聊天框
-// tabCapture 捕获整个 Tab，但因为视口只剩视频，录制内容纯净
+// ★ 深度 DOM 树隔离与视口清洗（解决录制多余网页内容的问题）
 // ============================================================
 function applyViewportSanitize() {
-  // 自动选取页面中最大的有效视频
   const video = pickBestVideo();
   if (!video) {
     console.warn('[content] 视口清洗：未找到有效视频');
     return;
   }
 
-  // 避免重复应用
   if (CS.sanitizedVideo === video) return;
-
-  // 备份原始 style
-  CS.origStyle      = video.getAttribute('style') || '';
   CS.sanitizedVideo = video;
+  CS.isolatedElements = [];
 
-  // 注入清洗样式
-  if (!CS.sanitizeStyle) {
-    CS.sanitizeStyle    = document.createElement('style');
-    CS.sanitizeStyle.id = '__rec_sanitize__';
+  // 1. 回溯收集视频元素的所有祖先节点 (深度兼容 Shadow DOM 穿透)
+  const ancestors = new Set();
+  let curr = video;
+  while (curr && curr !== document.documentElement) {
+    ancestors.add(curr);
+    if (curr.parentElement) {
+      curr = curr.parentElement;
+    } else if (curr.parentNode) {
+      if (curr.parentNode instanceof ShadowRoot) {
+        curr = curr.parentNode.host;
+      } else {
+        curr = curr.parentNode;
+      }
+    } else {
+      curr = null;
+    }
+  }
+  ancestors.add(document.documentElement);
+  ancestors.add(document.body);
+
+  // 2. 深度递归遍历树，将所有不属于视频祖先的元素强行 display: none!important 隐藏
+  function isolateNode(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
+    const tag = node.tagName;
+    if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK') return;
+
+    if (!ancestors.has(node)) {
+      const origDisplay = node.style.getPropertyValue('display');
+      const origImportance = node.style.getPropertyPriority('display');
+
+      CS.isolatedElements.push({
+        el: node,
+        type: 'hide',
+        origDisplay: origDisplay || '',
+        origImportance: origImportance || ''
+      });
+
+      node.style.setProperty('display', 'none', 'important');
+      return; // 终止非祖先节点子树的后续遍历
+    }
+
+    // 遍历 light DOM 子节点
+    if (node.children) {
+      Array.from(node.children).forEach(child => isolateNode(child));
+    }
+
+    // 深度穿透 Shadow DOM 内部
+    if (node.shadowRoot && node.shadowRoot.children) {
+      Array.from(node.shadowRoot.children).forEach(child => isolateNode(child));
+    }
   }
 
-  const cls = '__rec_sanitized_el__';
-  video.classList.add(cls);
+  // 开始执行全页面 DOM 纯净化清洗
+  isolateNode(document.body);
 
-  CS.sanitizeStyle.textContent = `
-    /* ★ R-01 视口清洗：视频全屏铺满，遮挡所有网页杂质 */
-    .${cls} {
-      position   : fixed !important;
-      top        : 0 !important;
-      left       : 0 !important;
-      width      : 100vw !important;
-      height     : 100vh !important;
-      max-width  : none !important;
-      max-height : none !important;
-      z-index    : 2147483640 !important;
-      background : #000 !important;
-      object-fit : contain !important;
-      transform  : none !important;
-      margin     : 0 !important;
-      padding    : 0 !important;
-      border     : none !important;
-      border-radius : 0 !important;
-      box-shadow : none !important;
-      opacity    : 1 !important;
-      visibility : visible !important;
+  // 3. 额外隐藏视频容器内除了 video 本身以外的兄弟节点 (如自定义进度条、暂停浮层、同级弹幕层)
+  if (video.parentElement) {
+    Array.from(video.parentElement.children).forEach((sibling) => {
+      if (sibling !== video && sibling.tagName !== 'SCRIPT' && sibling.tagName !== 'STYLE' && sibling.tagName !== 'LINK') {
+        const origDisplay = sibling.style.getPropertyValue('display');
+        const origImportance = sibling.style.getPropertyPriority('display');
+
+        CS.isolatedElements.push({
+          el: sibling,
+          type: 'hide',
+          origDisplay: origDisplay || '',
+          origImportance: origImportance || ''
+        });
+        sibling.style.setProperty('display', 'none', 'important');
+      }
+    });
+  }
+
+  // 4. 清洗并重置所有祖先容器盒模型，移除 Transform、Filter 及 Overflow 剪裁，使视频能完全伸展
+  ancestors.forEach((el) => {
+    if (el === document.documentElement || el === document.body) {
+      CS.isolatedElements.push({
+        el: el,
+        type: 'root',
+        origStyle: el.getAttribute('style') || ''
+      });
+      el.style.setProperty('background', '#000', 'important');
+      el.style.setProperty('overflow', 'hidden', 'important');
+      el.style.setProperty('margin', '0', 'important');
+      el.style.setProperty('padding', '0', 'important');
+      el.style.setProperty('width', '100vw', 'important');
+      el.style.setProperty('height', '100vh', 'important');
+      return;
     }
-    /* 页面背景变黑，防止页面内容透出 */
-    body { background : #000 !important; overflow : hidden !important; }
-  `;
 
-  (document.head || document.documentElement).appendChild(CS.sanitizeStyle);
-  console.log('[content] ★ R-01 视口清洗已应用');
+    CS.isolatedElements.push({
+      el: el,
+      type: 'ancestor',
+      origStyle: el.getAttribute('style') || ''
+    });
+
+    el.style.setProperty('position', 'static', 'important');
+    el.style.setProperty('margin', '0', 'important');
+    el.style.setProperty('padding', '0', 'important');
+    el.style.setProperty('width', '100%', 'important');
+    el.style.setProperty('height', '100%', 'important');
+    el.style.setProperty('max-width', 'none', 'important');
+    el.style.setProperty('max-height', 'none', 'important');
+    el.style.setProperty('transform', 'none', 'important');
+    el.style.setProperty('filter', 'none', 'important');
+    el.style.setProperty('perspective', 'none', 'important');
+    el.style.setProperty('overflow', 'visible', 'important');
+    el.style.setProperty('clip', 'auto', 'important');
+    el.style.setProperty('contain', 'none', 'important');
+    el.style.setProperty('opacity', '1', 'important');
+  });
+
+  // 5. 将核心 <video> 直播元素强行拉伸并 fixed 充满整个浏览器视口进行内录
+  CS.isolatedElements.push({
+    el: video,
+    type: 'video',
+    origStyle: video.getAttribute('style') || ''
+  });
+
+  video.style.setProperty('position', 'fixed', 'important');
+  video.style.setProperty('top', '0', 'important');
+  video.style.setProperty('left', '0', 'important');
+  video.style.setProperty('width', '100vw', 'important');
+  video.style.setProperty('height', '100vh', 'important');
+  video.style.setProperty('z-index', '2147483647', 'important');
+  video.style.setProperty('background', '#000', 'important');
+  video.style.setProperty('object-fit', 'contain', 'important');
+  video.style.setProperty('transform', 'none', 'important');
+  video.style.setProperty('margin', '0', 'important');
+  video.style.setProperty('padding', '0', 'important');
+  video.style.setProperty('border', 'none', 'important');
+  video.style.setProperty('border-radius', '0', 'important');
+  video.style.setProperty('box-shadow', 'none', 'important');
+  video.style.setProperty('opacity', '1', 'important');
+  video.style.setProperty('visibility', 'visible', 'important');
+
+  console.log('[content] ★ 深度 DOM 纯化清洗隔离已应用，视频已完美满屏');
 }
 
-// 录制结束后还原网页布局
+// 录制结束后无损还原原本的页面布局
 function removeViewportSanitize() {
-  if (CS.sanitizedVideo) {
-    CS.sanitizedVideo.classList.remove('__rec_sanitized_el__');
-    if (CS.origStyle) {
-      CS.sanitizedVideo.setAttribute('style', CS.origStyle);
-    } else {
-      CS.sanitizedVideo.removeAttribute('style');
+  if (!CS.sanitizedVideo) return;
+
+  console.log('[content] ★ 开始还原网页原本的布局结构...');
+
+  // 逆序还原，保证样式树不产生断层和重叠覆盖
+  for (let i = CS.isolatedElements.length - 1; i >= 0; i--) {
+    const item = CS.isolatedElements[i];
+    try {
+      if (!item.el) continue;
+
+      if (item.type === 'hide') {
+        if (item.origDisplay === '' || item.origDisplay === 'none') {
+          item.el.style.removeProperty('display');
+        } else {
+          item.el.style.setProperty('display', item.origDisplay, item.origImportance || '');
+        }
+      } else if (item.type === 'ancestor' || item.type === 'root' || item.type === 'video') {
+        if (item.origStyle === '') {
+          item.el.removeAttribute('style');
+        } else {
+          item.el.setAttribute('style', item.origStyle);
+        }
+      }
+    } catch (e) {
+      console.warn('[content] 样式节点恢复失败:', e);
     }
-    CS.sanitizedVideo = null;
-    CS.origStyle      = null;
   }
-  if (CS.sanitizeStyle) {
-    CS.sanitizeStyle.remove();
-    CS.sanitizeStyle = null;
-  }
-  console.log('[content] ★ R-01 视口清洗已移除，页面已还原');
+
+  CS.sanitizedVideo = null;
+  CS.isolatedElements = [];
+  console.log('[content] ★ 网页已无损复原');
 }
 
 // ============================================================
-// ★ Shadow DOM 深度穿透检索（R-05）
+// ★ Shadow DOM 深度穿透检索
 // ============================================================
 function findVideosDeep(root) {
   root = root || document;
@@ -139,7 +233,6 @@ function findVideosDeep(root) {
       if (ch) for (let i = 0; i < ch.length; i++) traverse(ch[i]);
     }
 
-    // ★ 穿透 Shadow Root
     if (node.shadowRoot) traverse(node.shadowRoot);
   }
 
@@ -147,18 +240,15 @@ function findVideosDeep(root) {
   return videos;
 }
 
-// 判断是否为有效直播视频
 function isValidVideo(video) {
   if (!video) return false;
   const rect = video.getBoundingClientRect();
   if (rect.width < 320 || rect.height < 180) return false;
   if (!video.src && !video.srcObject && !video.currentSrc) return false;
-  // 排除已知时长很短的广告视频
   if (isFinite(video.duration) && video.duration > 0 && video.duration < 15) return false;
   return true;
 }
 
-// 选出面积最大的有效视频
 function pickBestVideo() {
   let best = null, bestArea = 0;
   for (const v of findVideosDeep()) {
@@ -175,14 +265,11 @@ function pickBestVideo() {
 // ============================================================
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg.action) {
-
-    // ★ R-01：background 通知执行视口清洗
     case 'applyViewportSanitize':
       applyViewportSanitize();
       sendResponse({ ok: true });
       break;
 
-    // ★ R-01：录制结束，还原页面
     case 'removeViewportSanitize':
       removeViewportSanitize();
       sendResponse({ ok: true });
@@ -222,8 +309,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ============================================================
 // 视频检测 + 悬浮录制栏
 // ============================================================
-
-// 单一防抖绑定
 function throttledBindAll() {
   if (CS.bindTimeout) return;
   CS.bindTimeout = setTimeout(() => {
@@ -235,17 +320,14 @@ function throttledBindAll() {
 function initVideoDetection() {
   findVideosDeep().forEach(bindVideo);
 
-  // 全局 mouseover：穿透透明遮罩层
   document.addEventListener('mouseover', onGlobalMouseover, { passive: true });
 
-  // DOM 变化监听
   CS.observer = new MutationObserver((mutations) => {
     let hasVideo = false;
     for (const m of mutations) {
       for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
-        if (node.tagName === 'VIDEO' ||
-            (node.querySelector && node.querySelector('video'))) {
+        if (node.tagName === 'VIDEO' || (node.querySelector && node.querySelector('video'))) {
           hasVideo = true; break;
         }
       }
@@ -274,7 +356,6 @@ function onGlobalMouseover(e) {
   }
 }
 
-// 多策略寻找附近视频（穿透透明遮罩）
 function findVideoNear(target) {
   if (!target) return null;
   if (target.tagName === 'VIDEO') return target;
@@ -313,7 +394,6 @@ function bindVideo(video) {
   }, { passive: true });
 }
 
-// ── 悬浮录制栏样式注入 ───────────────────────────────────────
 function injectHoverStyle() {
   if (document.getElementById('__rec_hover_style__')) return;
   const s = document.createElement('style');
@@ -441,9 +521,7 @@ function destroyHoverBar() {
   CS.hoverVideo = null;
 }
 
-// ── 点击录制：通知 background 执行完整录制启动流程 ────────────
 function onClickRecord(video) {
-  // 选最优视频（若传入的无效则重新选）
   const target = (video && isValidVideo(video)) ? video : pickBestVideo();
   if (!target) {
     showToast('❌ 未找到有效的直播视频，请确认视频正在播放');
@@ -451,11 +529,8 @@ function onClickRecord(video) {
   }
 
   destroyHoverBar();
-  showToast('🎬 正在启动录制，网页即将最小化...');
+  showToast('🎬 正在提取隔离标签页，请在新弹出的控制台管理录制...');
 
-  // 通知 background：
-  //   background 会立即最小化宿主窗口 + 获取 streamId + 打开 recorder
-  //   recorder 在自己进程内消费 streamId，画面不卡
   chrome.runtime.sendMessage({
     action: 'startRecordFromContent',
     config: {
@@ -477,7 +552,6 @@ function onClickRecord(video) {
   });
 }
 
-// 画中画
 async function togglePiP(video) {
   try {
     if (document.pictureInPictureElement === video) {
@@ -605,7 +679,6 @@ function stopFloatTimer() {
   if (CS.floatTimer) { clearInterval(CS.floatTimer); CS.floatTimer = null; }
 }
 
-// ── 拖拽 ─────────────────────────────────────────────────────
 function makeDraggable(el) {
   let drag = false, sx, sy, ox, oy;
   el.addEventListener('mousedown', (e) => {
@@ -627,7 +700,6 @@ function makeDraggable(el) {
   document.addEventListener('mouseup', () => { drag = false; });
 }
 
-// ── Toast ─────────────────────────────────────────────────────
 function showToast(msg, ms) {
   ms = ms || 3000;
   let el = document.getElementById('__rec_toast__');
@@ -655,7 +727,9 @@ function showToast(msg, ms) {
   el.__t = setTimeout(() => { el.style.opacity = '0'; }, ms);
 }
 
-// ── 区域选择 ─────────────────────────────────────────────────
+// ============================================================
+// 区域选择
+// ============================================================
 function startRegion() {
   if (CS.regionActive) return;
   CS.regionActive = true;
@@ -733,7 +807,9 @@ function startRegion() {
 
 function stopRegion() { CS.regionActive = false; }
 
-// ── 启动 ─────────────────────────────────────────────────────
+// ============================================================
+// 启动
+// ============================================================
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', initVideoDetection);
 } else {
