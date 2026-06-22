@@ -1,15 +1,14 @@
 'use strict';
 
-// ============================================================
-// Background Service Worker v3.1
-// 核心变更：
-//   1. 结合 video.captureStream() 纯视频流内录设计。
-//   2. 引入 tabCapture 保活机制 (Wake-lock)：在后台激活一个静默的 
-//      tabCapture 流，强制 Chrome 的合成器与渲染器在后台以 full-frame 运行，
-//      彻底攻克切换标签页/最小化时 video.captureStream() 产生的“花屏/冻结”缺陷！
-//   3. 添加双引擎容灾机制：当 video.captureStream() 因 CORS 报错受限时，
-//      自动无缝降级采用 tabCapture 底层流完成高质量捕获。
-// ============================================================
+/**
+ * background.js - 跨进程双向管道调度器
+ * 
+ * 物理职责：
+ * 1. 建立 content_stream ↔ recorder_pipeline 的无损桥接通道
+ * 2. 调度启动缓冲池，防止小窗初始化期间丢帧
+ * 3. 监控网页端生命周期，意外断开时通知小窗紧急挽救落盘
+ * 4. 执行安全下载与 Blob URL 的即时物理销毁
+ */
 
 let recordingState = {
   isRecording      : false,
@@ -25,26 +24,65 @@ let recordingState = {
 };
 
 let popupPort = null;
+let activeContentPort = null;
+let activeRecorderPort = null;
+let startupBuffer = []; // 启动缓冲池：暂存小窗打开前的数据片 [永恒一]
 
-// ── Popup 长连接 ──────────────────────────────────────────────
+// 跨进程 Port 通道桥接器
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'popup') return;
-  popupPort = port;
-  port.postMessage({ action: 'stateSync', state: recordingState });
-  port.onDisconnect.addListener(() => { popupPort = null; });
-  port.onMessage.addListener(handlePopupCommand);
+  if (port.name === 'popup') {
+    popupPort = port;
+    port.postMessage({ action: 'stateSync', state: recordingState });
+    port.onDisconnect.addListener(() => { popupPort = null; });
+    port.onMessage.addListener(handlePopupCommand);
+    return;
+  }
+
+  // 采集端连接入网
+  if (port.name === 'content_stream') {
+    activeContentPort = port;
+    port.onMessage.addListener((msg) => {
+      if (activeRecorderPort) {
+        activeRecorderPort.postMessage(msg);
+      } else {
+        startupBuffer.push(msg); // 小窗尚未就绪，压入缓冲池防止丢帧
+      }
+    });
+    port.onDisconnect.addListener(() => {
+      activeContentPort = null;
+      // 物理崩溃探针：网页端长连接异常断开（如标签页 OOM），通知小窗紧急自愈
+      if (activeRecorderPort) {
+        activeRecorderPort.postMessage({ action: 'content_disconnected' });
+      }
+    });
+    return;
+  }
+
+  // 接收端（控制小窗）连接入网
+  if (port.name === 'recorder_pipeline') {
+    activeRecorderPort = port;
+    // 立即冲刷缓冲池中的历史数据
+    if (startupBuffer.length > 0) {
+      startupBuffer.forEach(msg => activeRecorderPort.postMessage(msg));
+      startupBuffer = [];
+    }
+    port.onDisconnect.addListener(() => {
+      activeRecorderPort = null;
+    });
+    return;
+  }
 });
 
-// ── 获取 tabCapture 独占 streamId ─────────────────────────────
 function getStreamIdForTab(tabId) {
   return new Promise((resolve, reject) => {
     if (!chrome.tabCapture) {
-      reject(new Error('tabCapture 不可用，请确认已声明权限'));
+      reject(new Error('tabCapture 不可用，请声明权限'));
       return;
     }
     chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (streamId) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
+      const err = chrome.runtime.lastError;
+      if (err) {
+        reject(new Error(err.message));
       } else if (!streamId) {
         reject(new Error('streamId 为空'));
       } else {
@@ -54,7 +92,6 @@ function getStreamIdForTab(tabId) {
   });
 }
 
-// ── 录制小窗管理 ─────────────────────────────────────────────
 async function ensureRecorderWindow(config, tabId, autoStart, streamId) {
   if (recordingState.recorderWindowId) {
     try {
@@ -69,7 +106,7 @@ async function ensureRecorderWindow(config, tabId, autoStart, streamId) {
     tabId    : tabId || '',
     config   : JSON.stringify(config || {}),
     autoStart: autoStart ? 'true' : 'false',
-    streamId : streamId || '', // 注入保活与备用捕获使用的 streamId
+    streamId : streamId || '', 
   });
 
   const win = await chrome.windows.create({
@@ -83,7 +120,6 @@ async function ensureRecorderWindow(config, tabId, autoStart, streamId) {
   recordingState.recorderWindowId = win.id;
 }
 
-// 监听录制窗口被意外关闭 → 通知 content 脚本停止并保存
 chrome.windows.onRemoved.addListener((windowId) => {
   if (windowId !== recordingState.recorderWindowId) return;
   recordingState.recorderWindowId = null;
@@ -91,7 +127,6 @@ chrome.windows.onRemoved.addListener((windowId) => {
   if (recordingState.isRecording) {
     recordingState.isRecording = false;
     recordingState.isPaused    = false;
-    // 通知 content 脚本执行紧急保存
     if (recordingState.activeTabId) {
       chrome.tabs.sendMessage(
         recordingState.activeTabId,
@@ -104,7 +139,6 @@ chrome.windows.onRemoved.addListener((windowId) => {
   }
 });
 
-// ── Popup 指令处理 ────────────────────────────────────────────
 async function handlePopupCommand(msg) {
   const allowed = ['startRecording','stopRecording','pauseRecording','resumeRecording'];
   if (!allowed.includes(msg.action)) return;
@@ -121,13 +155,10 @@ async function handlePopupCommand(msg) {
       } catch (e) {
         console.warn('[bg] 获取 streamId 失败:', e.message);
       }
-
       await ensureRecorderWindow(msg.config || {}, tabId, false, streamId);
     });
   } else {
-    // 转发给 recorder 窗口
     chrome.runtime.sendMessage({ ...msg, _target: 'recorder' }).catch(() => {});
-    // 同时通知 content 脚本（兜底）
     if (recordingState.activeTabId) {
       chrome.tabs.sendMessage(
         recordingState.activeTabId,
@@ -138,7 +169,6 @@ async function handlePopupCommand(msg) {
   }
 }
 
-// ── 文件名消毒 ────────────────────────────────────────────────
 function sanitizeFilename(raw) {
   if (!raw || typeof raw !== 'string') return 'recording.webm';
   return raw
@@ -149,10 +179,8 @@ function sanitizeFilename(raw) {
     .slice(0, 200) || 'recording.webm';
 }
 
-// ── 消息路由 ─────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 
-  // 1. 实时指标回传
   if (req.action === 'metricsUpdate') {
     Object.assign(recordingState, {
       isRecording: req.isRecording,
@@ -164,17 +192,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     });
 
     if (popupPort) {
-      popupPort.postMessage({
-        action     : 'metricsUpdate',
-        isRecording: req.isRecording,
-        isPaused   : req.isPaused,
-        timeString : req.timeString,
-        sizeString : req.sizeString,
-        bitrate    : req.bitrate,
-        resolution : req.resolution,
-        fps        : req.fps,
-        cpu        : req.cpu,
-      });
+      popupPort.postMessage({ ...req, action: 'metricsUpdate' });
     }
 
     broadcastToTab(recordingState.activeTabId, {
@@ -187,7 +205,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return;
   }
 
-  // 2. 录制状态变更
   if (req.action === 'recordingStateChanged') {
     Object.assign(recordingState, req.state);
     if (popupPort) popupPort.postMessage({ action: 'stateSync', state: recordingState });
@@ -198,7 +215,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return;
   }
 
-  // 3. 安全下载（唯一入口，含文件名消毒）
   if (req.action === 'triggerDownload') {
     const safeName = sanitizeFilename(req.filename);
     chrome.downloads.download({
@@ -214,17 +230,15 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       }
       sendResponse({ downloadId });
 
-      // 下载完成后回收 Blob 内存
       function onChanged(delta) {
         if (delta.id !== downloadId) return;
         const st = delta.state && delta.state.current;
         if (st === 'complete' || st === 'interrupted') {
           chrome.downloads.onChanged.removeListener(onChanged);
-          // 通知数据持有方释放
+          // 物理内存释放信号下发
           chrome.runtime.sendMessage(
             { _target: 'recorder', action: 'releaseBlobUrl', url: req.url }
           ).catch(() => {});
-          // 同时通知 content 脚本释放
           if (recordingState.activeTabId) {
             chrome.tabs.sendMessage(
               recordingState.activeTabId,
@@ -239,7 +253,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return true;
   }
 
-  // 4. content 脚本触发开录（从悬浮栏点击）
   if (req.action === 'startRecordFromContent') {
     const tabId = sender.tab && sender.tab.id;
     if (!tabId) { sendResponse({ error: 'no_tab_id' }); return; }
@@ -254,14 +267,13 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         sendResponse({ ok: true });
       })
       .catch(async (e) => {
-        console.error('[bg] 获取 streamId 失败，尝试降级启动:', e.message);
+        console.error('[bg] 获取 streamId 失败，降级启动:', e.message);
         await ensureRecorderWindow(config, tabId, autoStart, '');
         sendResponse({ ok: true, warn: e.message });
       });
     return true;
   }
 
-  // 5. 容灾降级：CORS 触发时，content 通知 recorder 页面启动 tabCapture 录制
   if (req.action === 'fallbackToTabCapture') {
     chrome.runtime.sendMessage({
       _target: 'recorder',
@@ -272,7 +284,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return;
   }
 
-  // 6. 显示悬浮窗
   if (req.action === 'showFloat') {
     const pos = req.position || 'top-right';
     if (recordingState.activeTabId) {
@@ -284,7 +295,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return;
   }
 
-  // 7. 系统通知
   if (req.action === 'notify') {
     if (chrome.notifications) {
       chrome.notifications.create('rec_' + Date.now(), {
@@ -298,7 +308,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return;
   }
 
-  // 8. 悬浮窗控制转发
   if (req.action === 'floatPause' || req.action === 'floatStop') {
     const action = req.action === 'floatStop' ? 'stopRecording' : 'pauseRecording';
     chrome.runtime.sendMessage({ _target: 'recorder', action }).catch(() => {});
@@ -316,7 +325,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   sendResponse({ ok: false });
 });
 
-// ── 工具函数 ─────────────────────────────────────────────────
 function broadcastToTab(tabId, msg) {
   if (!tabId) return;
   chrome.tabs.sendMessage(tabId, msg, () => { void chrome.runtime.lastError; });
