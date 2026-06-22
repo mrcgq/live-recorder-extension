@@ -1,3 +1,5 @@
+
+
 'use strict';
 
 // ============================================================
@@ -125,11 +127,11 @@ function bindEvents() {
     if (!el) return;
     el.addEventListener('change', () => {
       if (key === 'noAudio' && el.checked) {
-        if ($('sysAudio')) $('sysAudio').checked = false;
-        if ($('micAudio')) $('micAudio').checked = false;
+        if ($('sysAudio')) { $('sysAudio').checked = false; }
+        if ($('micAudio')) { $('micAudio').checked = false; }
       }
       if ((key === 'sysAudio' || key === 'micAudio') && el.checked) {
-        if ($('noAudio')) $('noAudio').checked = false;
+        if ($('noAudio')) { $('noAudio').checked = false; }
       }
       saveConfig();
     });
@@ -254,8 +256,6 @@ function setStatus(type, text) {
   if (txt) txt.textContent = text;
 }
 
-function setText(id, val) { const el = $(id); if (el) el.textContent = val; }
-
 function toggleRegion() {
   const btn = $('regionBtn');
   if (!btn) return;
@@ -308,3 +308,5 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadConfig();
   connectBg();
 });
+
+
