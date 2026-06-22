@@ -1,3 +1,5 @@
+
+
 'use strict';
 
 /**
@@ -54,6 +56,14 @@ function init() {
   setQualityHighlight(currentQuality);
   updateFormat();
   bindEvents();
+
+  // [自愈加固] 启动时立刻擦除任何可能残留的本地临时落盘缓存，确保磁盘空间 0% 堆积 [Law-39]
+  clearOPFSTempFile();
+
+  // [自愈加固] 启动时立刻激活保活流与视频预览，保证保活流 100% 准备就绪
+  if (presetStreamId) {
+    activateKeepAlive(presetStreamId);
+  }
 
   // 跨进程长连接管道接收端初始化
   const pipelinePort = chrome.runtime.connect({ name: 'recorder_pipeline' });
@@ -119,6 +129,7 @@ async function finalizeOPFSRecording(config) {
     
     const url = URL.createObjectURL(file);
 
+    // [纠正 2] 必须向 background 投递 triggerDownload 事务
     chrome.runtime.sendMessage({
       action: 'triggerDownload',
       url: url,
