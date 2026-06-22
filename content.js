@@ -1,35 +1,41 @@
 'use strict';
 
 // ============================================================
-// content.js v4.0 - 完整重构版
+// content.js v4.0 - 纯 UI 层（数据面已完全迁出）
 //
-// 重构要点：
-//   R-01: 视口清洗划界（视频全屏填充，过滤弹幕/广告）
-//   R-05: Shadow DOM 深度穿透检索器
-//   修复: 防抖单一化、透明层穿透、自动识别逻辑
-//   修复: 点击录制不自动开录（autoStart:false）
-//   修复: 悬浮控制条完整生命周期管理
+// 职责（仅限于此，不做任何录制）：
+//   1. Shadow DOM 穿透，识别直播视频，显示悬浮录制栏
+//   2. 视口清洗划界（applyViewportSanitize）
+//      将目标视频强制铺满全屏，过滤弹幕/广告
+//      tabCapture 捕获的 Tab 画面因此只含纯净视频
+//   3. 网页悬浮录制控制条（showFloat / updateFloat）
+//   4. 转发用户操作指令给 background/recorder
+//
+// 不在此处做的事（已迁回 recorder.js）：
+//   ✗ MediaRecorder
+//   ✗ captureStream()
+//   ✗ getUserMedia()
+//   ✗ AudioContext 录制
 // ============================================================
 
-// ── UI 状态对象 ───────────────────────────────────────────────
+// ── 状态 ─────────────────────────────────────────────────────
 const CS = {
-  hoverVideo       : null,
-  hoverBar         : null,
-  hoverRAF         : null,
-  leaveTimer       : null,
-  floatBar         : null,
-  floatTimer       : null,
-  floatSec         : 0,
-  floatPaused      : false,
-  regionActive     : false,
-  observer         : null,
-  bindTimeout      : null,   // ★ 单一防抖控制变量
-  sanitizedVideo   : null,   // ★ R-01：当前被清洗的视频元素
-  sanitizeStyle    : null,   // ★ R-01：注入的清洗样式元素
-  originalStyles   : null,   // ★ R-01：视频原始样式备份
+  hoverVideo     : null,
+  hoverBar       : null,
+  hoverRAF       : null,
+  leaveTimer     : null,
+  floatBar       : null,
+  floatTimer     : null,
+  floatSec       : 0,
+  floatPaused    : false,
+  regionActive   : false,
+  observer       : null,
+  bindTimeout    : null,
+  sanitizedVideo : null,   // 当前被清洗的视频元素
+  sanitizeStyle  : null,   // 注入的清洗样式
+  origStyle      : null,   // 视频原始 style 备份
 };
 
-// ── 工具函数 ─────────────────────────────────────────────────
 function fmtTime(s) {
   s = s || 0;
   return [Math.floor(s / 3600), Math.floor((s % 3600) / 60), s % 60]
@@ -37,8 +43,85 @@ function fmtTime(s) {
 }
 
 // ============================================================
-// ★ R-05：Shadow DOM 深度穿透检索器
-// 递归穿透所有 shadowRoot，100% 识别现代直播网站
+// ★ 视口清洗划界（R-01）
+// 将目标视频强制 fixed 满屏，遮挡弹幕/广告/聊天框
+// tabCapture 捕获整个 Tab，但因为视口只剩视频，录制内容纯净
+// ============================================================
+function applyViewportSanitize() {
+  // 自动选取页面中最大的有效视频
+  const video = pickBestVideo();
+  if (!video) {
+    console.warn('[content] 视口清洗：未找到有效视频');
+    return;
+  }
+
+  // 避免重复应用
+  if (CS.sanitizedVideo === video) return;
+
+  // 备份原始 style
+  CS.origStyle      = video.getAttribute('style') || '';
+  CS.sanitizedVideo = video;
+
+  // 注入清洗样式
+  if (!CS.sanitizeStyle) {
+    CS.sanitizeStyle    = document.createElement('style');
+    CS.sanitizeStyle.id = '__rec_sanitize__';
+  }
+
+  const cls = '__rec_sanitized_el__';
+  video.classList.add(cls);
+
+  CS.sanitizeStyle.textContent = `
+    /* ★ R-01 视口清洗：视频全屏铺满，遮挡所有网页杂质 */
+    .${cls} {
+      position   : fixed !important;
+      top        : 0 !important;
+      left       : 0 !important;
+      width      : 100vw !important;
+      height     : 100vh !important;
+      max-width  : none !important;
+      max-height : none !important;
+      z-index    : 2147483640 !important;
+      background : #000 !important;
+      object-fit : contain !important;
+      transform  : none !important;
+      margin     : 0 !important;
+      padding    : 0 !important;
+      border     : none !important;
+      border-radius : 0 !important;
+      box-shadow : none !important;
+      opacity    : 1 !important;
+      visibility : visible !important;
+    }
+    /* 页面背景变黑，防止页面内容透出 */
+    body { background : #000 !important; overflow : hidden !important; }
+  `;
+
+  (document.head || document.documentElement).appendChild(CS.sanitizeStyle);
+  console.log('[content] ★ R-01 视口清洗已应用');
+}
+
+// 录制结束后还原网页布局
+function removeViewportSanitize() {
+  if (CS.sanitizedVideo) {
+    CS.sanitizedVideo.classList.remove('__rec_sanitized_el__');
+    if (CS.origStyle) {
+      CS.sanitizedVideo.setAttribute('style', CS.origStyle);
+    } else {
+      CS.sanitizedVideo.removeAttribute('style');
+    }
+    CS.sanitizedVideo = null;
+    CS.origStyle      = null;
+  }
+  if (CS.sanitizeStyle) {
+    CS.sanitizeStyle.remove();
+    CS.sanitizeStyle = null;
+  }
+  console.log('[content] ★ R-01 视口清洗已移除，页面已还原');
+}
+
+// ============================================================
+// ★ Shadow DOM 深度穿透检索（R-05）
 // ============================================================
 function findVideosDeep(root) {
   root = root || document;
@@ -46,156 +129,65 @@ function findVideosDeep(root) {
 
   function traverse(node) {
     if (!node) return;
-    const type = node.nodeType;
-    // 只处理元素节点和 DocumentFragment（ShadowRoot 是后者）
-    if (type !== Node.ELEMENT_NODE && type !== Node.DOCUMENT_FRAGMENT_NODE) return;
+    const t = node.nodeType;
+    if (t !== Node.ELEMENT_NODE && t !== Node.DOCUMENT_FRAGMENT_NODE) return;
 
     if (node.tagName === 'VIDEO') {
       videos.push(node);
-      // video 内部不会再有 video，但可能有 shadowRoot（极少见）
     } else {
-      // 遍历子元素
-      const children = node.children;
-      if (children) {
-        for (let i = 0; i < children.length; i++) {
-          traverse(children[i]);
-        }
-      }
+      const ch = node.children;
+      if (ch) for (let i = 0; i < ch.length; i++) traverse(ch[i]);
     }
 
-    // ★ 穿透 Shadow Root 隔离墙
-    if (node.shadowRoot) {
-      traverse(node.shadowRoot);
-    }
+    // ★ 穿透 Shadow Root
+    if (node.shadowRoot) traverse(node.shadowRoot);
   }
 
   traverse(root);
   return videos;
 }
 
-// 判断是否为有效直播视频（非广告、非缩略图、非已结束的短视频）
-function isValidLiveVideo(video) {
+// 判断是否为有效直播视频
+function isValidVideo(video) {
   if (!video) return false;
-
-  // 尺寸过滤：至少 320x180 才认为是主视频
   const rect = video.getBoundingClientRect();
   if (rect.width < 320 || rect.height < 180) return false;
-
-  // 必须有视频源（src 或 srcObject 或 currentSrc）
   if (!video.src && !video.srcObject && !video.currentSrc) return false;
-
-  // 排除已明确结束的短视频（直播流 duration 为 Infinity 或接近 0）
+  // 排除已知时长很短的广告视频
   if (isFinite(video.duration) && video.duration > 0 && video.duration < 15) return false;
-
-  // 排除静音且暂停的广告视频（通常静音 + 暂停 = 预加载广告）
-  // 但不排除用户手动暂停的主视频，所以只在两者同时满足时排除
-  // （直播流通常不会同时 muted+paused 超过 3 秒）
   return true;
 }
 
-// 在所有视频中选出面积最大、最符合直播特征的视频
+// 选出面积最大的有效视频
 function pickBestVideo() {
-  const videos = findVideosDeep();
   let best = null, bestArea = 0;
-
-  for (const v of videos) {
-    if (!isValidLiveVideo(v)) continue;
-    const rect = v.getBoundingClientRect();
-    const area = rect.width * rect.height;
+  for (const v of findVideosDeep()) {
+    if (!isValidVideo(v)) continue;
+    const r    = v.getBoundingClientRect();
+    const area = r.width * r.height;
     if (area > bestArea) { bestArea = area; best = v; }
   }
-
   return best;
 }
 
 // ============================================================
-// ★ R-01：视口清洗划界（Viewport-Fitted Sanitization）
-// 将目标视频元素强制置顶满屏，遮挡所有网页杂质
-// ============================================================
-function applyViewportSanitize(video) {
-  if (!video || CS.sanitizedVideo === video) return;
-
-  // 备份原始内联样式
-  CS.originalStyles = video.getAttribute('style') || '';
-  CS.sanitizedVideo = video;
-
-  // 注入全局清洗样式（覆盖父容器、遮挡弹幕层）
-  if (!CS.sanitizeStyle) {
-    CS.sanitizeStyle = document.createElement('style');
-    CS.sanitizeStyle.id = '__rec_sanitize_style__';
-  }
-
-  // 生成唯一类名避免污染
-  const uid = '__rec_sanitized_video__';
-  video.classList.add(uid);
-
-  CS.sanitizeStyle.textContent = `
-    /* ★ R-01：视口清洗 - 强制视频满屏，遮挡所有杂质 */
-    .${uid} {
-      position: fixed !important;
-      top: 0 !important;
-      left: 0 !important;
-      width: 100vw !important;
-      height: 100vh !important;
-      max-width: none !important;
-      max-height: none !important;
-      min-width: 0 !important;
-      min-height: 0 !important;
-      z-index: 2147483640 !important;
-      background: #000 !important;
-      object-fit: contain !important;
-      transform: none !important;
-      margin: 0 !important;
-      padding: 0 !important;
-      border: none !important;
-      border-radius: 0 !important;
-      box-shadow: none !important;
-      clip-path: none !important;
-      opacity: 1 !important;
-      visibility: visible !important;
-      pointer-events: auto !important;
-    }
-    /* 确保 body 背景为黑，不透出页面内容 */
-    body.__rec_sanitize_body__ {
-      background: #000 !important;
-      overflow: hidden !important;
-    }
-  `;
-
-  (document.head || document.documentElement).appendChild(CS.sanitizeStyle);
-  document.body && document.body.classList.add('__rec_sanitize_body__');
-
-  console.log('[content] ★ R-01 视口清洗已应用 → 视频已全屏隔离');
-}
-
-// 移除视口清洗，还原网页原始布局
-function removeViewportSanitize() {
-  if (CS.sanitizedVideo) {
-    CS.sanitizedVideo.classList.remove('__rec_sanitized_video__');
-    // 还原原始内联样式
-    if (CS.originalStyles) {
-      CS.sanitizedVideo.setAttribute('style', CS.originalStyles);
-    } else {
-      CS.sanitizedVideo.removeAttribute('style');
-    }
-    CS.sanitizedVideo = null;
-    CS.originalStyles = null;
-  }
-
-  if (CS.sanitizeStyle) {
-    CS.sanitizeStyle.remove();
-    CS.sanitizeStyle = null;
-  }
-
-  document.body && document.body.classList.remove('__rec_sanitize_body__');
-  console.log('[content] ★ R-01 视口清洗已移除 → 页面布局已还原');
-}
-
-// ============================================================
-// 消息监听（来自 background 的指令）
+// 消息监听
 // ============================================================
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg.action) {
+
+    // ★ R-01：background 通知执行视口清洗
+    case 'applyViewportSanitize':
+      applyViewportSanitize();
+      sendResponse({ ok: true });
+      break;
+
+    // ★ R-01：录制结束，还原页面
+    case 'removeViewportSanitize':
+      removeViewportSanitize();
+      sendResponse({ ok: true });
+      break;
+
     case 'showFloat':
       showFloat(msg.position || 'top-right');
       sendResponse({ ok: true });
@@ -208,12 +200,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'updateFloat':
       updateFloat(msg.paused, msg.time);
-      sendResponse({ ok: true });
-      break;
-
-    // ★ R-01：录制结束，移除视口清洗
-    case 'removeViewportSanitize':
-      removeViewportSanitize();
       sendResponse({ ok: true });
       break;
 
@@ -234,11 +220,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // ============================================================
-// 视频检测与悬浮栏
+// 视频检测 + 悬浮录制栏
 // ============================================================
 
-// ★ 单一防抖：节流绑定，避免弹幕高频触发
-function throttledBindAllVideos() {
+// 单一防抖绑定
+function throttledBindAll() {
   if (CS.bindTimeout) return;
   CS.bindTimeout = setTimeout(() => {
     CS.bindTimeout = null;
@@ -252,23 +238,21 @@ function initVideoDetection() {
   // 全局 mouseover：穿透透明遮罩层
   document.addEventListener('mouseover', onGlobalMouseover, { passive: true });
 
-  // DOM 变化监听（新增视频节点时重新绑定）
+  // DOM 变化监听
   CS.observer = new MutationObserver((mutations) => {
-    let hasNewVideo = false;
+    let hasVideo = false;
     for (const m of mutations) {
       for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
         if (node.tagName === 'VIDEO' ||
             (node.querySelector && node.querySelector('video'))) {
-          hasNewVideo = true;
-          break;
+          hasVideo = true; break;
         }
       }
-      if (hasNewVideo) break;
+      if (hasVideo) break;
     }
-    if (hasNewVideo) throttledBindAllVideos();
+    if (hasVideo) throttledBindAll();
   });
-
   CS.observer.observe(document.documentElement, { childList: true, subtree: true });
 }
 
@@ -277,8 +261,7 @@ function onGlobalMouseover(e) {
   if (!target) return;
 
   const video = findVideoNear(target);
-
-  if (video && isValidLiveVideo(video)) {
+  if (video && isValidVideo(video)) {
     clearTimeout(CS.leaveTimer);
     if (CS.hoverVideo !== video) {
       CS.hoverVideo = video;
@@ -291,140 +274,103 @@ function onGlobalMouseover(e) {
   }
 }
 
-// 多策略综合寻找附近的视频元素（穿透遮罩层）
+// 多策略寻找附近视频（穿透透明遮罩）
 function findVideoNear(target) {
   if (!target) return null;
-
-  // 策略1：直接是 video
   if (target.tagName === 'VIDEO') return target;
-
-  // 策略2：目标有 shadowRoot，向内找
   if (target.shadowRoot) {
     const v = target.shadowRoot.querySelector('video');
     if (v) return v;
   }
-
-  // 策略3：向内查找
   if (target.querySelector) {
     const v = target.querySelector('video');
     if (v) return v;
   }
-
-  // 策略4：向上找播放器容器，再向内找
   if (target.closest) {
-    const selectors = [
-      '[class*="player"]', '[class*="Player"]',
-      '[class*="video"]',  '[class*="Video"]',
-      '[id*="player"]',    '[id*="Player"]',
-      'figure', 'main', '[role="main"]',
-    ].join(',');
-    const container = target.closest(selectors);
-    if (container) {
-      // 先检查 shadowRoot
-      if (container.shadowRoot) {
-        const v = container.shadowRoot.querySelector('video');
-        if (v) return v;
-      }
-      const v = container.querySelector('video');
+    const c = target.closest([
+      '[class*="player"]','[class*="Player"]',
+      '[class*="video"]', '[class*="Video"]',
+      '[id*="player"]',  '[id*="Player"]',
+      'figure','main',
+    ].join(','));
+    if (c) {
+      const v = (c.shadowRoot && c.shadowRoot.querySelector('video')) || c.querySelector('video');
       if (v) return v;
     }
   }
-
-  // 策略5：父节点向内查找（最后兜底）
   if (target.parentElement) {
     const v = target.parentElement.querySelector('video');
     if (v) return v;
   }
-
   return null;
 }
 
 function bindVideo(video) {
   if (video.__recBound) return;
   video.__recBound = true;
-
   video.addEventListener('mouseleave', () => {
     CS.leaveTimer = setTimeout(destroyHoverBar, 600);
   }, { passive: true });
 }
 
-// ============================================================
-// 悬浮录制栏 UI
-// ============================================================
+// ── 悬浮录制栏样式注入 ───────────────────────────────────────
 function injectHoverStyle() {
   if (document.getElementById('__rec_hover_style__')) return;
-  const style = document.createElement('style');
-  style.id = '__rec_hover_style__';
-  style.textContent = `
+  const s = document.createElement('style');
+  s.id    = '__rec_hover_style__';
+  s.textContent = `
     #__rec_hover_bar__ {
-      position: fixed;
-      z-index: 2147483647;
-      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-      border: 1px solid rgba(229,57,53,0.6);
-      border-top: 3px solid #e53935;
-      border-radius: 0 0 10px 10px;
-      height: 44px;
-      display: flex;
-      align-items: center;
-      box-shadow: 0 6px 24px rgba(229,57,53,0.3), 0 2px 8px rgba(0,0,0,0.5);
-      font-family: 'Microsoft YaHei', 'PingFang SC', Arial, sans-serif;
-      font-size: 12px;
-      color: #fff;
-      overflow: hidden;
-      user-select: none;
-      opacity: 0;
-      transition: opacity 0.18s ease;
-      pointer-events: auto;
-      min-width: 300px;
+      position:fixed; z-index:2147483647;
+      background:linear-gradient(135deg,#1a1a2e,#16213e);
+      border:1px solid rgba(229,57,53,.6);
+      border-top:3px solid #e53935;
+      border-radius:0 0 10px 10px; height:44px;
+      display:flex; align-items:center;
+      box-shadow:0 6px 24px rgba(229,57,53,.3),0 2px 8px rgba(0,0,0,.5);
+      font-family:'Microsoft YaHei','PingFang SC',Arial,sans-serif;
+      font-size:12px; color:#fff; overflow:hidden;
+      user-select:none; opacity:0;
+      transition:opacity .18s ease;
+      pointer-events:auto; min-width:280px;
     }
-    #__rec_hover_bar__.visible { opacity: 1; }
+    #__rec_hover_bar__.show { opacity:1; }
     #__rec_hover_bar__ .hb-logo {
-      background: #e53935;
-      width: 42px; height: 100%;
-      display: flex; align-items: center; justify-content: center;
-      flex-shrink: 0; font-size: 20px;
+      background:#e53935; width:42px; height:100%;
+      display:flex; align-items:center; justify-content:center;
+      flex-shrink:0; font-size:20px;
     }
     #__rec_hover_bar__ .hb-brand {
-      padding: 0 10px 0 12px;
-      font-size: 12px; font-weight: bold;
-      color: #ff8a80; white-space: nowrap; flex-shrink: 0;
-      border-right: 1px solid rgba(255,255,255,0.1);
-      height: 100%; display: flex; align-items: center;
+      padding:0 10px 0 12px; font-size:12px;
+      font-weight:bold; color:#ff8a80; white-space:nowrap;
+      flex-shrink:0; height:100%;
+      display:flex; align-items:center;
+      border-right:1px solid rgba(255,255,255,.1);
     }
     #__rec_hover_bar__ button {
-      background: transparent; border: none;
-      color: rgba(255,255,255,0.85);
-      height: 100%; padding: 0 15px;
-      cursor: pointer; font-size: 12px;
-      font-family: inherit;
-      display: flex; align-items: center; gap: 5px;
-      white-space: nowrap;
-      transition: background 0.15s, color 0.15s;
-      border-left: 1px solid rgba(255,255,255,0.08);
+      background:transparent; border:none;
+      color:rgba(255,255,255,.85); height:100%;
+      padding:0 15px; cursor:pointer; font-size:12px;
+      font-family:inherit; display:flex; align-items:center;
+      gap:5px; white-space:nowrap;
+      transition:background .15s,color .15s;
+      border-left:1px solid rgba(255,255,255,.08);
     }
     #__rec_hover_bar__ button:hover {
-      background: rgba(229,57,53,0.25);
-      color: #ff6b6b;
+      background:rgba(229,57,53,.25); color:#ff6b6b;
     }
     #__rec_hover_bar__ .hb-rec {
-      color: #ff5252 !important;
-      font-weight: bold;
-      background: rgba(229,57,53,0.12) !important;
+      color:#ff5252!important; font-weight:bold;
+      background:rgba(229,57,53,.12)!important;
     }
     #__rec_hover_bar__ .hb-rec:hover {
-      background: rgba(229,57,53,0.3) !important;
+      background:rgba(229,57,53,.3)!important;
     }
     #__rec_hover_bar__ .hb-close {
-      color: rgba(255,255,255,0.3) !important;
-      padding: 0 12px !important;
-      font-size: 16px !important;
-    }
-    #__rec_hover_bar__ .hb-close:hover {
-      background: rgba(255,255,255,0.05) !important;
-      color: rgba(255,255,255,0.7) !important;
+      color:rgba(255,255,255,.3)!important;
+      padding:0 12px!important; font-size:16px!important;
     }
   `;
-  (document.head || document.documentElement).appendChild(style);
+  (document.head || document.documentElement).appendChild(s);
 }
 
 function createHoverBar(video) {
@@ -436,18 +382,16 @@ function createHoverBar(video) {
   bar.innerHTML = `
     <div class="hb-logo">🎬</div>
     <div class="hb-brand">直播内录器</div>
-    <button class="hb-rec"  id="__hb_rec__">⏺ 开始录制</button>
-    <button               id="__hb_pip__">📺 小窗播放</button>
+    <button class="hb-rec" id="__hb_rec__">⏺ 开始录制</button>
+    <button id="__hb_pip__">📺 小窗播放</button>
     <button class="hb-close" id="__hb_close__">✕</button>
   `;
 
-  // 鼠标进出控制显隐
   bar.addEventListener('mouseenter', () => clearTimeout(CS.leaveTimer));
   bar.addEventListener('mouseleave', () => {
     CS.leaveTimer = setTimeout(destroyHoverBar, 400);
   });
 
-  // 按钮事件（完全程序化绑定，杜绝 CSP 拦截）
   bar.querySelector('#__hb_rec__').addEventListener('click', (e) => {
     e.stopPropagation();
     onClickRecord(video);
@@ -463,15 +407,12 @@ function createHoverBar(video) {
 
   document.documentElement.appendChild(bar);
   CS.hoverBar = bar;
-
   positionHoverBar(video);
 
-  // 双 RAF 确保 transition 生效
   requestAnimationFrame(() => requestAnimationFrame(() => {
-    if (CS.hoverBar) CS.hoverBar.classList.add('visible');
+    if (CS.hoverBar) CS.hoverBar.classList.add('show');
   }));
 
-  // 持续跟随视频元素位置（应对布局变化）
   function trackLoop() {
     if (!CS.hoverBar || !CS.hoverVideo) return;
     positionHoverBar(CS.hoverVideo);
@@ -483,52 +424,38 @@ function createHoverBar(video) {
 function positionHoverBar(video) {
   if (!CS.hoverBar) return;
   const rect = video.getBoundingClientRect();
-  const barW = CS.hoverBar.offsetWidth || 300;
-
-  // 水平居中于视频，但不超出视口
-  let left = rect.left + rect.width / 2 - barW / 2;
-  left = Math.max(4, Math.min(left, window.innerWidth - barW - 4));
-
-  // 悬停在视频顶部内侧（不超出视口顶部）
-  let top = Math.max(0, rect.top);
-
+  const barW = CS.hoverBar.offsetWidth || 280;
+  let left   = rect.left + rect.width / 2 - barW / 2;
+  left       = Math.max(4, Math.min(left, window.innerWidth - barW - 4));
   CS.hoverBar.style.left = left + 'px';
-  CS.hoverBar.style.top  = top + 'px';
+  CS.hoverBar.style.top  = Math.max(0, rect.top) + 'px';
 }
 
 function destroyHoverBar() {
   clearTimeout(CS.leaveTimer);
   if (CS.hoverRAF) { cancelAnimationFrame(CS.hoverRAF); CS.hoverRAF = null; }
   if (CS.hoverBar) {
-    CS.hoverBar.classList.remove('visible');
-    // 等 transition 结束后再移除 DOM
+    CS.hoverBar.classList.remove('show');
     setTimeout(() => { if (CS.hoverBar) { CS.hoverBar.remove(); CS.hoverBar = null; } }, 200);
   }
   CS.hoverVideo = null;
 }
 
-// ============================================================
-// ★ 核心：点击录制
-// 流程：视口清洗 → 通知 background → 打开 recorder 窗口
-// ============================================================
+// ── 点击录制：通知 background 执行完整录制启动流程 ────────────
 function onClickRecord(video) {
-  if (!video || !isValidLiveVideo(video)) {
-    video = pickBestVideo();
-    if (!video) {
-      showToast('❌ 未找到有效的直播视频，请确认视频正在播放');
-      return;
-    }
+  // 选最优视频（若传入的无效则重新选）
+  const target = (video && isValidVideo(video)) ? video : pickBestVideo();
+  if (!target) {
+    showToast('❌ 未找到有效的直播视频，请确认视频正在播放');
+    return;
   }
 
   destroyHoverBar();
+  showToast('🎬 正在启动录制，网页即将最小化...');
 
-  // ★ R-01：应用视口清洗（视频全屏填充，遮挡弹幕广告）
-  applyViewportSanitize(video);
-
-  showToast('🎬 视频画面已隔离，正在打开录制控制窗口...');
-
-  // 通知 background 打开录制控制窗口
-  // autoStart=true：recorder 窗口打开后立即开始录制
+  // 通知 background：
+  //   background 会立即最小化宿主窗口 + 获取 streamId + 打开 recorder
+  //   recorder 在自己进程内消费 streamId，画面不卡
   chrome.runtime.sendMessage({
     action: 'startRecordFromContent',
     config: {
@@ -541,14 +468,11 @@ function onClickRecord(video) {
       fps       : 30,
       filePrefix: '直播录制',
       quality   : 'hd',
-      autoStart : true,   // ★ 从网页悬浮栏触发 → 自动开录
     },
   }, (resp) => {
     void chrome.runtime.lastError;
-    if (!resp || !resp.ok) {
-      // 如果打开失败，移除清洗
-      removeViewportSanitize();
-      showToast('❌ 打开录制窗口失败，请重试');
+    if (resp && resp.error) {
+      showToast('❌ 启动失败: ' + resp.error);
     }
   });
 }
@@ -588,59 +512,38 @@ function showFloat(position) {
     'position:fixed',
     posMap[position] || posMap['top-right'],
     'z-index:2147483647',
-    'background:rgba(8,8,8,0.97)',
+    'background:rgba(8,8,8,.97)',
     'border:2px solid #e53935',
     'border-radius:12px',
     'padding:8px 14px',
     'display:flex', 'align-items:center', 'gap:10px',
     'font-family:Microsoft YaHei,PingFang SC,Arial,sans-serif',
     'font-size:13px', 'color:#fff',
-    'box-shadow:0 4px 32px rgba(229,57,53,0.55)',
+    'box-shadow:0 4px 32px rgba(229,57,53,.55)',
     'user-select:none', 'min-width:240px',
     'backdrop-filter:blur(16px)',
-    '-webkit-backdrop-filter:blur(16px)',
     'cursor:move',
   ].join(';');
 
   bar.innerHTML = `
-    <style>@keyframes _rfblink{0%,100%{opacity:1}50%{opacity:.1}}</style>
-    <span style="
-      width:11px;height:11px;border-radius:50%;
-      background:#e53935;flex-shrink:0;display:inline-block;
-      animation:_rfblink 1s infinite;
-      box-shadow:0 0 8px rgba(229,57,53,0.8);
-    "></span>
-    <span id="_rf_time" style="
-      font-family:'Courier New',monospace;
-      font-size:15px;font-weight:bold;
-      color:#ff5252;letter-spacing:2px;flex:1;
-      min-width:80px;
-    ">00:00:00</span>
-    <span id="_rf_size" style="
-      font-size:11px;color:#666;
-      font-family:'Courier New',monospace;
-      margin-right:2px;
-    ">0 B</span>
-    <button id="_rf_pause" style="
-      background:rgba(255,152,0,0.15);
-      border:1px solid rgba(255,152,0,0.6);
-      color:#ff9800;padding:5px 12px;border-radius:6px;
-      cursor:pointer;font-size:11px;font-family:inherit;
-      transition:all 0.2s;white-space:nowrap;
-    ">⏸ 暂停</button>
-    <button id="_rf_stop" style="
-      background:rgba(229,57,53,0.15);
-      border:1px solid rgba(229,57,53,0.6);
-      color:#e53935;padding:5px 12px;border-radius:6px;
-      cursor:pointer;font-size:11px;font-family:inherit;
-      transition:all 0.2s;white-space:nowrap;
-    ">⏹ 停止</button>
-    <button id="_rf_close" style="
-      background:transparent;border:none;
-      color:rgba(255,255,255,0.3);cursor:pointer;
-      font-size:20px;line-height:1;padding:0 2px;
-      transition:color 0.2s;
-    ">×</button>
+    <style>@keyframes _rfb{0%,100%{opacity:1}50%{opacity:.1}}</style>
+    <span style="width:11px;height:11px;border-radius:50%;background:#e53935;
+      flex-shrink:0;display:inline-block;animation:_rfb 1s infinite;
+      box-shadow:0 0 8px rgba(229,57,53,.8);"></span>
+    <span id="_rf_time" style="font-family:'Courier New',monospace;
+      font-size:15px;font-weight:bold;color:#ff5252;letter-spacing:2px;
+      flex:1;min-width:80px;">00:00:00</span>
+    <button id="_rf_pause" style="background:rgba(255,152,0,.15);
+      border:1px solid rgba(255,152,0,.6);color:#ff9800;
+      padding:5px 12px;border-radius:6px;cursor:pointer;
+      font-size:11px;font-family:inherit;transition:all .2s;">⏸ 暂停</button>
+    <button id="_rf_stop" style="background:rgba(229,57,53,.15);
+      border:1px solid rgba(229,57,53,.6);color:#e53935;
+      padding:5px 12px;border-radius:6px;cursor:pointer;
+      font-size:11px;font-family:inherit;transition:all .2s;">⏹ 停止</button>
+    <button id="_rf_close" style="background:transparent;border:none;
+      color:rgba(255,255,255,.3);cursor:pointer;
+      font-size:20px;line-height:1;padding:0 2px;">×</button>
   `;
 
   document.documentElement.appendChild(bar);
@@ -667,7 +570,7 @@ function showFloat(position) {
 
   bar.querySelector('#_rf_close').addEventListener('click', () => {
     removeFloat();
-    showToast('⚠️ 悬浮条已隐藏，录制仍在后台继续');
+    showToast('⚠️ 控制条已隐藏，录制仍在后台继续');
   });
 
   makeDraggable(bar);
@@ -692,9 +595,9 @@ function startFloatTimer() {
   CS.floatTimer = setInterval(() => {
     if (CS.floatPaused) return;
     CS.floatSec++;
-    const te = document.getElementById('_rf_time');
-    if (!te) { stopFloatTimer(); return; }
-    te.textContent = fmtTime(CS.floatSec);
+    const el = document.getElementById('_rf_time');
+    if (!el) { stopFloatTimer(); return; }
+    el.textContent = fmtTime(CS.floatSec);
   }, 1000);
 }
 
@@ -724,7 +627,7 @@ function makeDraggable(el) {
   document.addEventListener('mouseup', () => { drag = false; });
 }
 
-// ── Toast 提示 ────────────────────────────────────────────────
+// ── Toast ─────────────────────────────────────────────────────
 function showToast(msg, ms) {
   ms = ms || 3000;
   let el = document.getElementById('__rec_toast__');
@@ -734,17 +637,15 @@ function showToast(msg, ms) {
     el.style.cssText = [
       'position:fixed', 'bottom:80px', 'left:50%',
       'transform:translateX(-50%)',
-      'background:rgba(8,8,8,0.97)',
-      'border:1px solid rgba(255,255,255,0.15)',
+      'background:rgba(8,8,8,.97)',
+      'border:1px solid rgba(255,255,255,.15)',
       'color:#fff', 'padding:12px 26px',
       'border-radius:10px', 'font-size:13px',
       'font-family:Microsoft YaHei,PingFang SC,Arial,sans-serif',
       'z-index:2147483647', 'pointer-events:none',
       'white-space:nowrap',
-      'box-shadow:0 4px 24px rgba(0,0,0,0.6)',
+      'box-shadow:0 4px 24px rgba(0,0,0,.6)',
       'transition:opacity .3s', 'opacity:0',
-      'max-width:90vw',
-      'backdrop-filter:blur(12px)',
     ].join(';');
     document.documentElement.appendChild(el);
   }
@@ -761,20 +662,19 @@ function startRegion() {
 
   const overlay = document.createElement('div');
   overlay.style.cssText = [
-    'position:fixed', 'inset:0', 'z-index:2147483646',
-    'background:rgba(0,0,0,0.45)', 'cursor:crosshair',
+    'position:fixed','inset:0','z-index:2147483646',
+    'background:rgba(0,0,0,.45)','cursor:crosshair',
   ].join(';');
 
   const tip = document.createElement('div');
   tip.style.cssText = [
-    'position:fixed', 'top:50%', 'left:50%',
+    'position:fixed','top:50%','left:50%',
     'transform:translate(-50%,-50%)',
-    'background:rgba(229,57,53,0.95)',
-    'color:#fff', 'padding:14px 32px', 'border-radius:10px',
+    'background:rgba(229,57,53,.95)',
+    'color:#fff','padding:14px 32px','border-radius:10px',
     'font-size:15px',
     'font-family:Microsoft YaHei,PingFang SC,Arial,sans-serif',
-    'pointer-events:none', 'user-select:none', 'white-space:nowrap',
-    'box-shadow:0 4px 20px rgba(0,0,0,0.4)',
+    'pointer-events:none','user-select:none','white-space:nowrap',
   ].join(';');
   tip.textContent = '🔲 拖拽选择录制区域 · Esc 取消';
   overlay.appendChild(tip);
@@ -787,20 +687,14 @@ function startRegion() {
     startX = e.clientX; startY = e.clientY;
     selBox = document.createElement('div');
     selBox.style.cssText = [
-      'position:fixed',
-      'border:2px dashed #e53935',
-      'background:rgba(229,57,53,0.08)',
-      'pointer-events:none',
-      'z-index:2147483647',
+      'position:fixed','border:2px dashed #e53935',
+      'background:rgba(229,57,53,.08)',
+      'pointer-events:none','z-index:2147483647',
     ].join(';');
     document.documentElement.appendChild(selBox);
   });
 
-  document.addEventListener('mousemove', onRegionMove);
-  document.addEventListener('mouseup',   onRegionUp);
-  document.addEventListener('keydown',   onRegionKey);
-
-  function onRegionMove(e) {
+  function onMove(e) {
     if (!selBox) return;
     selBox.style.left   = Math.min(e.clientX, startX) + 'px';
     selBox.style.top    = Math.min(e.clientY, startY) + 'px';
@@ -808,7 +702,7 @@ function startRegion() {
     selBox.style.height = Math.abs(e.clientY - startY) + 'px';
   }
 
-  function onRegionUp(e) {
+  function onUp(e) {
     if (!selBox) return;
     const w = Math.abs(e.clientX - startX);
     const h = Math.abs(e.clientY - startY);
@@ -817,20 +711,24 @@ function startRegion() {
     if (w > 10 && h > 10) showToast('🔲 已选区域: ' + Math.round(w) + '×' + Math.round(h));
   }
 
-  function onRegionKey(e) {
+  function onKey(e) {
     if (e.key !== 'Escape') return;
     if (selBox) { selBox.remove(); selBox = null; }
     cleanup();
-    showToast('🔲 区域选择已取消');
+    showToast('区域选择已取消');
   }
 
   function cleanup() {
     CS.regionActive = false;
     overlay.remove();
-    document.removeEventListener('mousemove', onRegionMove);
-    document.removeEventListener('mouseup',   onRegionUp);
-    document.removeEventListener('keydown',   onRegionKey);
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup',   onUp);
+    document.removeEventListener('keydown',   onKey);
   }
+
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup',   onUp);
+  document.addEventListener('keydown',   onKey);
 }
 
 function stopRegion() { CS.regionActive = false; }
