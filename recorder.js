@@ -5,9 +5,8 @@
  * 
  * 物理职责：
  * 1. 作为独立进程，接收 content.js 跨进程推送来的原始分片数据
- * 2. 引入 Origin Private File System (OPFS)，执行高性能、无阻碍的文件流直写
- * 3. 崩溃自愈保护：探测到网页连接意外断开（崩溃）时，自动触发文件封口及自适应下载
- * 4. 下载完成即时执行 OPFS 临时磁盘空间完全抹除，确保空间零占用
+ * 2. 物理加固：绑定控制面板 btnActiveStart 按钮，主动向原网页投递直录嗅探指令，规避鼠标悬浮局限 [纠正 3]
+ * 3. 崩溃自愈保护：意外断网或页面进程死亡时，即刻关闭流强制落盘挽回
  */
 
 const QUALITY_PRESETS = {
@@ -31,6 +30,7 @@ let writableStream   = null;
 let opfsInitialized  = false;
 let currentTotalBytes = 0;
 let currentConfig    = {};
+let isNormalStop     = false; 
 
 // Fallback 模式状态
 let fallbackRecorder = null;
@@ -61,19 +61,21 @@ function init() {
     if (msg.action === 'chunk') {
       await writeToOPFS(msg.blob);
       currentTotalBytes += msg.blob.size;
+    } else if (msg.action === 'complete') {
+      isNormalStop = true;
+      await finalizeOPFSRecording(currentConfig);
     } else if (msg.action === 'content_disconnected') {
-      await handleContentCrash();
+      if (!isNormalStop) {
+        await handleContentCrash();
+      }
+      isNormalStop = false; 
     }
   });
 }
 
-// ============================================================
-// OPFS 高性能持久化存储核心 [Law-52]
-// ============================================================
 async function initOPFS() {
   try {
     const root = await navigator.storage.getDirectory();
-    // 使用专属的私有缓存文件名，100% 避免普通网页脚本嗅探读取
     fileHandle = await root.getFileHandle('live_recording_cache.tmp', { create: true });
     writableStream = await fileHandle.createWritable({ keepExistingData: false });
     opfsInitialized = true;
@@ -96,11 +98,10 @@ async function writeToOPFS(blob) {
   }
 }
 
-// 物理合并落盘与安全恢复引擎
 async function finalizeOPFSRecording(config) {
   if (!writableStream) return;
   try {
-    await writableStream.close(); // 锁定并封口文件流
+    await writableStream.close(); 
     writableStream = null;
     opfsInitialized = false;
 
@@ -116,14 +117,17 @@ async function finalizeOPFSRecording(config) {
     const ts = new Date().toISOString().replace('T', '_').replace(/:/g, '-').slice(0, 19);
     const filename = prefix + '_' + ts + '.' + ext;
     
-    // 生成安全链接
     const url = URL.createObjectURL(file);
 
-    chrome.downloads.download({
+    chrome.runtime.sendMessage({
+      action: 'triggerDownload',
       url: url,
-      filename: filename,
-      conflictAction: 'uniquify',
-      saveAs: false
+      filename: filename
+    }, (resp) => {
+      if (resp && resp.error) {
+        console.error('[OPFS] 下载唤醒失败:', resp.error);
+        URL.revokeObjectURL(url);
+      }
     });
 
     chrome.runtime.sendMessage({
@@ -135,7 +139,6 @@ async function finalizeOPFSRecording(config) {
   }
 }
 
-// 崩溃自愈保护：网页端突发死锁/强杀时紧急回收并合并已录制成果
 async function handleContentCrash() {
   console.warn('[OPFS] 警告：检测到网页长连接断开（网页可能崩溃）。执行紧急自愈保存...');
   if (writableStream) {
@@ -160,6 +163,33 @@ function bindEvents() {
   $('qUHD').addEventListener('click', () => setQuality('uhd'));
   $('qHD').addEventListener('click',  () => setQuality('hd'));
   $('qSD').addEventListener('click',  () => setQuality('sd'));
+
+  // 物理加固：绑定小窗控制台的主动直录强力唤醒按纽 [纠正 3]
+  const activeStartBtn = $('btnActiveStart');
+  if (activeStartBtn) {
+    activeStartBtn.addEventListener('click', () => {
+      if (!activeTabId) {
+        showError('❌ 无法定位到直播源标签页');
+        return;
+      }
+      
+      const config = buildConfigForQuality(currentQuality);
+      
+      // 主动向原直播网页发出“一键强制直录”信号，击穿悬浮遮罩盲区
+      chrome.tabs.sendMessage(activeTabId, { action: 'start_recording_now', config: config }, (response) => {
+        const err = chrome.runtime.lastError;
+        if (err || !response || !response.ok) {
+          showError('⚠️ 原网页上未检索到正在播放的视频，无缝切换为 tabCapture 备用全页面录制...');
+          
+          // 若网页中没有找到播放器，100% 顺势自愈降级为直接捕获标签页录制
+          chrome.runtime.sendMessage({
+            action: 'startTabCaptureRecording',
+            config: config
+          });
+        }
+      });
+    });
+  }
 
   $('bigRecBtn').addEventListener('click', () => {
     if (fallbackRecorder) {
@@ -349,7 +379,6 @@ function sendToContent(action, extra) {
   );
 }
 
-// 统一事件分发器
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg._target === 'recorder') {
     switch (msg.action) {
@@ -369,7 +398,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg.url) {
           URL.revokeObjectURL(msg.url);
         }
-        clearOPFSTempFile(); // 彻底销毁本地临时物理文件 [Law-39]
+        clearOPFSTempFile(); 
         break;
     }
     sendResponse({ ok: true });
@@ -400,7 +429,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   sendResponse({ ok: false });
 });
 
-// 长连接事件同步
 const bgPort = chrome.runtime.connect({ name: 'recorder_panel' });
 bgPort.onMessage.addListener((msg) => {
   if (msg.action === 'stateSync') {
@@ -445,7 +473,6 @@ function applyMetrics(msg) {
 
   if (msg.timeString) setText('timerDisplay', msg.timeString);
   
-  // 采用 OPFS 中写入的物理文件大小进行实时修正
   const sizeToDisplay = currentTotalBytes > 0 ? currentTotalBytes : (parseInt(msg.sizeString) || 0);
   setText('mSize', fmtSize(sizeToDisplay));
   
