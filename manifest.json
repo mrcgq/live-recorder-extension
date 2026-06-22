@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "直播内录器 Pro",
-  "version": "4.0.0",
-  "description": "Compositor级tabCapture，独立小窗录制引擎，最小化不卡死，纯净视频无杂质",
+  "version": "3.1.0",
+  "description": "精准捕获网页直播视频流，仅录制纯净视频画面，采用 tabCapture 独占保活引擎，支持后台/切页全帧率流畅内录",
   "permissions": [
     "activeTab",
     "storage",
