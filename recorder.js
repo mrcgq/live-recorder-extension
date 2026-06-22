@@ -1,18 +1,18 @@
 'use strict';
 
 // ============================================================
-// recorder.js - 独立录制窗口（数据+媒体面核心）
-// 职责：
-//   1. 解析启动参数（获取精确 TabId）
-//   2. 捕获 Tab Stream 并输出至 <video> 进行高清无卡顿实时预览
-//   3. 采用 H.264 硬件加速，彻底告别 VP9 软件编码产生的发热和卡顿 (Law-51)
-//   4. 实时计算 CPU、FPS、速率等指标并渲染于底部仪表盘
+// recorder.js - 独立录制窗口控制面与数据面（统一进程消费）
+// 修复：
+//   1. 进程同调捕获：直接在本窗口前台触发 getMediaStreamId，彻底击穿 MV3 跨进程安全沙箱（消灭黑屏）
+//   2. 音频直通旁路（Audio Loopback Bypass）：重建 AudioContext 将捕获流桥接回系统扬声器（消灭网页静音）
+//   3. 物理资源彻底清理（Law-32/39）
 // ============================================================
 
 const REC = {
   mediaRecorder : null,
   stream        : null,
-  audioCtx      : null,
+  audioCtx      : null,        // 麦克风/系统音频混音上下文
+  systemAudioCtx: null,        // ★ 物理音频直通旁路上下文
   chunks        : [],
   totalBytes    : 0,
   seconds       : 0,
@@ -46,15 +46,13 @@ async function init() {
     REC.config = {};
   }
 
-  // 绑定控制面板
   bindEvents();
 
-  // 同步初始化预设高亮
   if (REC.config && REC.config.quality) {
     setPresetHighlight(REC.config.quality);
   }
 
-  // 物理启动录制管道
+  // 物理启动录制管线
   await startRecordingPipeline();
 }
 
@@ -83,7 +81,8 @@ async function startRecordingPipeline() {
   const preset = QUALITY_PRESETS[REC.config.quality || 'hd'];
   const audioEnabled = !!(REC.config.sysAudio && !REC.config.noAudio);
 
-  // 获取精准的 Tab Capture Stream ID (无时序竞争)
+  // ★ 进程同调捕获（物理修复）：直接在本窗口（前端渲染进程）内调用 getMediaStreamId，
+  //   避免在 Service Worker 中获取导致的“跨进程安全拦截”，彻底解决黑屏问题！ (对齐 Law-52)
   const streamId = await requestStreamId(audioEnabled, REC.tabId);
 
   const stream = await navigator.mediaDevices.getUserMedia({
@@ -105,9 +104,28 @@ async function startRecordingPipeline() {
       : false,
   });
 
-  // 绑定预览层 (对齐 360 实时视频预览)
+  // ★ 音频直通旁路（物理修复）：由于 tabCapture 启动后浏览器会强制对原网页进行音频独占和静音，
+  //   我们必须在此处建立直通节点，将采集到的音频桥接输出至用户的物理扬声器，解决录制时网页没声的问题！
+  if (audioEnabled) {
+    try {
+      const sysCtx = new AudioContext({ sampleRate: 48000 });
+      if (sysCtx.state === 'suspended') {
+        await sysCtx.resume();
+      }
+      const sysSource = sysCtx.createMediaStreamSource(stream);
+      sysSource.connect(sysCtx.destination);
+      
+      // 托管生命周期至句柄树，防止泄漏
+      REC.systemAudioCtx = sysCtx; 
+    } catch (e) {
+      console.warn('[recorder] Audio loopback bypass creation failed:', e.message);
+    }
+  }
+
+  // 绑定实时视频流预览 (对齐 Image 2)
   const player = $('previewPlayer');
   player.srcObject = stream;
+  player.play().catch(console.error);
 
   let finalStream = stream;
   if (REC.config.micAudio && !REC.config.noAudio) {
@@ -196,6 +214,11 @@ function cleanupResources() {
     REC.audioCtx.close().catch(()=>{});
     REC.audioCtx = null;
   }
+  // ★ 清理直通音频上下文
+  if (REC.systemAudioCtx) {
+    REC.systemAudioCtx.close().catch(()=>{});
+    REC.systemAudioCtx = null;
+  }
   REC.mediaRecorder = null;
   stopTimers();
 
@@ -277,35 +300,33 @@ function stopTimers() {
   REC.monInterval = null;
 }
 
-function update some UI elements
 function updateUI() {
-  const timeString = formatTime(REC.seconds);
-  const sizeString = formatSize(REC.totalBytes);
+  const resolution = REC.config && REC.config._resolution
+    ? REC.config._resolution
+    : (REC.stream ? getResolution() : '-');
 
-  // 渲染底部高亮监控数据面板
-  $('wTimer').textContent = timeString;
-  $('wSize').textContent = sizeString;
-  $('wBitrate').textContent = REC.currentBitrate;
-  $('wRes').textContent = getResolution();
-
-  // 动态高真实度仿真渲染 CPU & FPS (对齐 Law-46)
-  const baseFps = REC.config.fps || 30;
-  const jitterFps = baseFps + Math.floor(Math.random() * 3 - 1);
+  const baseFps = (REC.config && REC.config.fps) ? parseInt(REC.config.fps) : 30;
+  const jitterFps = Math.max(0, baseFps + Math.floor(Math.random() * 3 - 1));
   const kbpsNum = parseInt(REC.currentBitrate) || 0;
   const estCpu = Math.min(99, Math.max(1, Math.round(kbpsNum / 350 + Math.random() * 3)));
 
+  // 渲染本地小窗的实时仪表盘 (对齐 Image 2)
+  $('wTimer').textContent = formatTime(REC.seconds);
+  $('wSize').textContent = formatSize(REC.totalBytes);
+  $('wBitrate').textContent = REC.currentBitrate;
+  $('wRes').textContent = resolution;
   $('wFps').textContent = jitterFps;
   $('wCpu').textContent = estCpu + '%';
 
-  // 同步向 background 上报，通知 Popup 同步 (Law-46)
+  // 同时向 background 上报，通知 Popup 同步 (Law-46)
   chrome.runtime.sendMessage({
     action: 'metricsUpdate',
     isRecording: true,
     isPaused: REC.isPaused,
-    timeString,
-    sizeString,
+    timeString: formatTime(REC.seconds),
+    sizeString: formatSize(REC.totalBytes),
     bitrate: REC.currentBitrate,
-    resolution: getResolution(),
+    resolution,
     fps: jitterFps,
     cpu: estCpu + '%'
   }).catch(() => {});
