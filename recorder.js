@@ -1,16 +1,14 @@
 'use strict';
 
-// ============================================================
-// recorder.js v3.1 - 保活及控制中心
-//
-// 核心变更：
-//   1. 接收 `background.js` 传入的 `streamId` 并通过 getUserMedia 
-//      对目标标签页进行后台保活抓取，促使 Chromium 在切标签页/最小化时 
-//      强制渲染视频播放器，100% 根治后台花屏、画面冻结等问题！
-//   2. 完美内置音频直通环路：修复了 tabCapture 导致原网页静音的副作用。
-//   3. 双引擎容灾：当 content.js 录制报错时，本窗口自动接管录制，
-//      无缝以 tabCapture 画面为备用引擎完成安全内录与下载。
-// ============================================================
+/**
+ * recorder.js - OPFS 极速自愈录制引擎
+ * 
+ * 物理职责：
+ * 1. 作为独立进程，接收 content.js 跨进程推送来的原始分片数据
+ * 2. 引入 Origin Private File System (OPFS)，执行高性能、无阻碍的文件流直写
+ * 3. 崩溃自愈保护：探测到网页连接意外断开（崩溃）时，自动触发文件封口及自适应下载
+ * 4. 下载完成即时执行 OPFS 临时磁盘空间完全抹除，确保空间零占用
+ */
 
 const QUALITY_PRESETS = {
   uhd: { label:'超清 4K',  vbps:16_000_000, abps:256_000, fps:60, res:'3840×2160' },
@@ -27,32 +25,135 @@ let presetStreamId   = null;
 let keepAliveStream  = null;
 let audioContext     = null;
 
-// 备用录制相关
+// OPFS 引擎状态机
+let fileHandle       = null;
+let writableStream   = null;
+let opfsInitialized  = false;
+let currentTotalBytes = 0;
+let currentConfig    = {};
+
+// Fallback 模式状态
 let fallbackRecorder = null;
-let fallbackChunks   = [];
 let fallbackSeconds  = 0;
 let fallbackTimer    = null;
 
 const $ = (id) => document.getElementById(id);
 
-// ============================================================
-// 初始化
-// ============================================================
 function init() {
   const params   = new URLSearchParams(window.location.search);
   activeTabId    = parseInt(params.get('tabId')) || null;
   presetStreamId = params.get('streamId') || null;
 
   try {
-    const config = JSON.parse(decodeURIComponent(params.get('config') || '{}'));
-    if (config.quality && QUALITY_PRESETS[config.quality]) {
-      currentQuality = config.quality;
+    currentConfig = JSON.parse(decodeURIComponent(params.get('config') || '{}'));
+    if (currentConfig.quality && QUALITY_PRESETS[currentConfig.quality]) {
+      currentQuality = currentConfig.quality;
     }
   } catch (_) {}
 
   setQualityHighlight(currentQuality);
   updateFormat();
   bindEvents();
+
+  // 跨进程长连接管道接收端初始化
+  const pipelinePort = chrome.runtime.connect({ name: 'recorder_pipeline' });
+  pipelinePort.onMessage.addListener(async (msg) => {
+    if (msg.action === 'chunk') {
+      await writeToOPFS(msg.blob);
+      currentTotalBytes += msg.blob.size;
+    } else if (msg.action === 'content_disconnected') {
+      await handleContentCrash();
+    }
+  });
+}
+
+// ============================================================
+// OPFS 高性能持久化存储核心 [Law-52]
+// ============================================================
+async function initOPFS() {
+  try {
+    const root = await navigator.storage.getDirectory();
+    // 使用专属的私有缓存文件名，100% 避免普通网页脚本嗅探读取
+    fileHandle = await root.getFileHandle('live_recording_cache.tmp', { create: true });
+    writableStream = await fileHandle.createWritable({ keepExistingData: false });
+    opfsInitialized = true;
+    console.log('[OPFS] 高性能沙箱文件流初始化成功。');
+  } catch (e) {
+    showError('❌ OPFS 存储系统加载失败: ' + e.message);
+  }
+}
+
+async function writeToOPFS(blob) {
+  if (!opfsInitialized) {
+    await initOPFS();
+  }
+  if (writableStream) {
+    try {
+      await writableStream.write(blob);
+    } catch (e) {
+      console.error('[OPFS] 块写入失败:', e);
+    }
+  }
+}
+
+// 物理合并落盘与安全恢复引擎
+async function finalizeOPFSRecording(config) {
+  if (!writableStream) return;
+  try {
+    await writableStream.close(); // 锁定并封口文件流
+    writableStream = null;
+    opfsInitialized = false;
+
+    const file = await fileHandle.getFile();
+    if (file.size === 0) {
+      console.warn('[OPFS] 检测到空视频流');
+      return;
+    }
+
+    const mime = file.type || 'video/webm';
+    const ext = mime.includes('mp4') ? 'mp4' : 'webm';
+    const prefix = (config && config.filePrefix) ? config.filePrefix : '直播录制';
+    const ts = new Date().toISOString().replace('T', '_').replace(/:/g, '-').slice(0, 19);
+    const filename = prefix + '_' + ts + '.' + ext;
+    
+    // 生成安全链接
+    const url = URL.createObjectURL(file);
+
+    chrome.downloads.download({
+      url: url,
+      filename: filename,
+      conflictAction: 'uniquify',
+      saveAs: false
+    });
+
+    chrome.runtime.sendMessage({
+      action: 'notify',
+      message: '✅ 录制成功落盘！体积: ' + fmtSize(file.size)
+    });
+  } catch (e) {
+    console.error('[OPFS] 最终落盘合并失败:', e);
+  }
+}
+
+// 崩溃自愈保护：网页端突发死锁/强杀时紧急回收并合并已录制成果
+async function handleContentCrash() {
+  console.warn('[OPFS] 警告：检测到网页长连接断开（网页可能崩溃）。执行紧急自愈保存...');
+  if (writableStream) {
+    await finalizeOPFSRecording(currentConfig);
+    showError('⚠️ 直播播放页面已断开，已为您自动挽救并合并之前录制的全部视频！');
+  }
+  isRecording = false;
+  updateUI();
+}
+
+async function clearOPFSTempFile() {
+  try {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry('live_recording_cache.tmp');
+    console.log('[OPFS] 临时落盘物理缓存已安全擦除，空间释放。');
+  } catch (e) {
+    console.warn('[OPFS] 缓存擦除失败:', e.message);
+  }
 }
 
 function bindEvents() {
@@ -99,11 +200,11 @@ function bindEvents() {
 }
 
 // ============================================================
-// ★ tabCapture 独占静默保活 (Bypass Rendering Throttling)
+// tabCapture 独占保活 (静默拉流，锁死后台帧率)
 // ============================================================
 async function activateKeepAlive(streamId) {
   if (keepAliveStream) return;
-  console.log('[recorder] 启动静默保活，streamId:', streamId);
+  console.log('[recorder] 激活物理保活流, streamId:', streamId);
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {
@@ -122,7 +223,6 @@ async function activateKeepAlive(streamId) {
 
     keepAliveStream = stream;
 
-    // 音频旁路直通：解决 tabCapture 静音网页播放器的缺陷，在控制面板还原扬声器输出
     if (stream.getAudioTracks().length > 0) {
       try {
         const sysCtx = new AudioContext({ sampleRate: 48000 });
@@ -131,7 +231,7 @@ async function activateKeepAlive(streamId) {
         source.connect(sysCtx.destination);
         audioContext = sysCtx;
       } catch (ae) {
-        console.warn('[recorder] 音频直通失败:', ae.message);
+        console.warn('[recorder] 绕过扬声器失败:', ae.message);
       }
     }
 
@@ -143,10 +243,8 @@ async function activateKeepAlive(streamId) {
         if (container) container.style.display = 'block';
       }).catch(() => {});
     }
-
-    console.log('[recorder] ★ 静默保活已激活，后台渲染被锁定，永不花屏断影！');
   } catch (e) {
-    console.warn('[recorder] 静默保活激活失败:', e.message);
+    console.warn('[recorder] 物理保活流建立失败:', e.message);
   }
 }
 
@@ -163,19 +261,18 @@ function releaseKeepAlive() {
   const container = $('previewContainer');
   if (player) player.srcObject = null;
   if (container) container.style.display = 'none';
-  console.log('[recorder] ★ 保活流已关闭。');
 }
 
 // ============================================================
-// ★ 容灾降级机制：备用 tabCapture 录制管线
+// 备用 tabCapture 录制管线 (CORS Fallback)
 // ============================================================
-function startFallbackRecording(config) {
+async function startFallbackRecording(config) {
   if (!keepAliveStream) {
-    showError('❌ 备用内录引擎启动失败：独占保活流未准备就绪');
+    showError('❌ 备用录制器启动失败：保活流就绪异常');
     return;
   }
 
-  fallbackChunks = [];
+  currentTotalBytes = 0;
   fallbackSeconds = 0;
 
   try {
@@ -186,14 +283,15 @@ function startFallbackRecording(config) {
       audioBitsPerSecond: config.abps || 192_000,
     });
 
-    fallbackRecorder.ondataavailable = (e) => {
+    fallbackRecorder.ondataavailable = async (e) => {
       if (e.data && e.data.size > 0) {
-        fallbackChunks.push(e.data);
+        await writeToOPFS(e.data); // 直接追加写入沙箱文件
+        currentTotalBytes += e.data.size;
       }
     };
 
-    fallbackRecorder.onstop = () => {
-      saveFallbackVideo(config);
+    fallbackRecorder.onstop = async () => {
+      await finalizeOPFSRecording(config);
     };
 
     fallbackRecorder.start(1000);
@@ -202,9 +300,9 @@ function startFallbackRecording(config) {
     updateUI();
 
     startFallbackTimer();
-    console.log('[recorder] ★ 备用 tabCapture 内录引擎已运行');
+    console.log('[recorder] 备用 OPFS-TabCapture 录制引擎开始运行。');
   } catch (e) {
-    showError('❌ 备用引擎启动失败: ' + e.message);
+    showError('❌ 备用引擎故障: ' + e.message);
   }
 }
 
@@ -217,42 +315,17 @@ function stopFallbackRecording() {
   updateUI();
 }
 
-function saveFallbackVideo(config) {
-  if (!fallbackChunks.length) return;
-  const mime = (fallbackRecorder && fallbackRecorder.mimeType) || 'video/webm';
-  const blob = new Blob(fallbackChunks, { type: mime });
-  const ext  = mime.includes('mp4') ? 'mp4' : 'webm';
-  const prefix = (config.filePrefix || '直播录制') + '_备用';
-  const ts   = new Date().toISOString().replace('T', '_').replace(/:/g, '-').slice(0, 19);
-  const filename = prefix + '_' + ts + '.' + ext;
-  const url  = URL.createObjectURL(blob);
-
-  chrome.runtime.sendMessage({ action: 'triggerDownload', url, filename }, (resp) => {
-    if (resp && resp.error) console.error('备用下载失败:', resp.error);
-  });
-
-  chrome.runtime.sendMessage({
-    action: 'notify',
-    message: '✅ 录制完成（备用引擎）！' + fmtSize(blob.size)
-  });
-
-  fallbackChunks = [];
-  fallbackRecorder = null;
-  releaseKeepAlive();
-}
-
 function startFallbackTimer() {
   stopFallbackTimer();
   fallbackTimer = setInterval(() => {
     if (isPaused) return;
     fallbackSeconds++;
-    const totalBytes = fallbackChunks.reduce((acc, c) => acc + c.size, 0);
 
     applyMetrics({
       isRecording: true,
       isPaused: isPaused,
       timeString: fmtTime(fallbackSeconds),
-      sizeString: fmtSize(totalBytes),
+      sizeString: fmtSize(currentTotalBytes),
       bitrate: '8Mbps',
       resolution: QUALITY_PRESETS[currentQuality].res,
       fps: 30
@@ -264,12 +337,9 @@ function stopFallbackTimer() {
   if (fallbackTimer) { clearInterval(fallbackTimer); fallbackTimer = null; }
 }
 
-// ============================================================
-// 消息交互
-// ============================================================
 function sendToContent(action, extra) {
   if (!activeTabId) {
-    showError('❌ 未连接到目标页面，请重新打开');
+    showError('❌ 未定位到目标页面，请重新开启');
     return;
   }
   chrome.tabs.sendMessage(
@@ -279,6 +349,7 @@ function sendToContent(action, extra) {
   );
 }
 
+// 统一事件分发器
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg._target === 'recorder') {
     switch (msg.action) {
@@ -294,12 +365,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (fallbackRecorder) { fallbackRecorder.resume(); isPaused = false; updateUI(); }
         else                  sendToContent('resumeRecording');
         break;
+      case 'releaseBlobUrl':
+        if (msg.url) {
+          URL.revokeObjectURL(msg.url);
+        }
+        clearOPFSTempFile(); // 彻底销毁本地临时物理文件 [Law-39]
+        break;
     }
     sendResponse({ ok: true });
     return;
   }
 
-  // 接收来自 background 的 CORS 备用触发
   if (msg.action === 'startTabCaptureRecording') {
     startFallbackRecording(msg.config || {});
     sendResponse({ ok: true });
@@ -324,7 +400,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   sendResponse({ ok: false });
 });
 
-// 长连接同步
+// 长连接事件同步
 const bgPort = chrome.runtime.connect({ name: 'recorder_panel' });
 bgPort.onMessage.addListener((msg) => {
   if (msg.action === 'stateSync') {
@@ -343,12 +419,10 @@ function applyState(state) {
 
   updateUI();
 
-  // 录制开启 → 启动独占保活 (Bypass Throttling)
   if (isRecording && !wasRecording && !keepAliveStream && presetStreamId) {
     activateKeepAlive(presetStreamId);
   }
 
-  // 录制结束 → 解锁释放保活流
   if (!isRecording && wasRecording) {
     releaseKeepAlive();
   }
@@ -367,15 +441,18 @@ function applyState(state) {
 function applyMetrics(msg) {
   isRecording = !!msg.isRecording;
   isPaused    = !!msg.isPaused;
-
   updateUI();
 
   if (msg.timeString) setText('timerDisplay', msg.timeString);
-  if (msg.sizeString) setText('mSize', msg.sizeString);
+  
+  // 采用 OPFS 中写入的物理文件大小进行实时修正
+  const sizeToDisplay = currentTotalBytes > 0 ? currentTotalBytes : (parseInt(msg.sizeString) || 0);
+  setText('mSize', fmtSize(sizeToDisplay));
+  
   if (msg.bitrate)    setText('mBitrate', msg.bitrate);
   if (msg.resolution) setText('mRes', msg.resolution);
   if (msg.fps)        setText('mFps', String(msg.fps));
-  if (msg.sizeString) setText('footerInfo', '已录制 ' + msg.sizeString);
+  setText('footerInfo', '已录制 ' + fmtSize(sizeToDisplay));
 }
 
 function updateUI() {
@@ -422,7 +499,6 @@ function updateUI() {
   }
 }
 
-// ── 质量与格式管理 ───────────────────────────────────────────
 function setQuality(q) {
   if (!QUALITY_PRESETS[q]) return;
   currentQuality = q;
