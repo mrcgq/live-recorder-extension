@@ -59,7 +59,29 @@ function throttledBindAllVideos() {
   }, 1000);
 }
 
-// 全局流式指针嗅探：穿透透明控制图层，100% 唤醒
+// ★ 深度优先遍历：穿透所有 Open 状态的 Shadow Root 寻找视频元素 (对齐 Law-11)
+function findVideosDeep(root = document) {
+  const videos = [];
+  function traverse(node) {
+    if (!node) return;
+    if (node.tagName === 'VIDEO') {
+      videos.push(node);
+    }
+    if (node.children && node.children.length > 0) {
+      for (let i = 0; i < node.children.length; i++) {
+        traverse(node.children[i]);
+      }
+    }
+    // 穿透 Shadow Root 隔离墙
+    if (node.shadowRoot) {
+      traverse(node.shadowRoot);
+    }
+  }
+  traverse(root);
+  return videos;
+}
+
+// 全局流式指针嗅探：穿透透明控制图层与 Shadow DOM，100% 唤醒
 function initVideoDetection() {
   bindAllVideos();
 
@@ -72,10 +94,16 @@ function initVideoDetection() {
     if (target.tagName === 'VIDEO') {
       video = target;
     } else {
-      // 穿透遮罩层：向上或向内检索视频
-      video = target.querySelector('video') || 
-              (target.parentElement && target.parentElement.querySelector('video')) ||
-              (target.closest && target.closest('.player, .video-container, [class*="player"]') && target.closest('.player, .video-container, [class*="player"]').querySelector('video'));
+      // 如果目标元素有影子 DOM，尝试向内探测
+      if (target.shadowRoot) {
+        video = target.shadowRoot.querySelector('video');
+      }
+      if (!video) {
+        // 穿透遮罩层：向上或向内检索视频
+        video = target.querySelector('video') || 
+                (target.parentElement && target.parentElement.querySelector('video')) ||
+                (target.closest && target.closest('.player, .video-container, [class*="player"]') && target.closest('.player, .video-container, [class*="player"]').querySelector('video'));
+      }
     }
 
     if (video) {
@@ -119,7 +147,7 @@ function initVideoDetection() {
 }
 
 function bindAllVideos() {
-  document.querySelectorAll('video').forEach(bindVideo);
+  findVideosDeep().forEach(bindVideo);
 }
 
 function bindVideo(video) {
@@ -132,7 +160,7 @@ function bindVideo(video) {
 }
 
 // ============================================================
-// 创建 360 风格高保真网页悬浮录制栏 (对齐 Image 1)
+// 创建 360 风格高保真网页悬浮录制栏
 // ============================================================
 function createHoverBar(video) {
   destroyHoverBar();
@@ -425,7 +453,7 @@ function showFloat(position) {
     removeFloat();
   });
 
-  bar.querySelector('#_rf_close').addEventListener('click', removeFloat);
+  bar.querySelector('#__live_rec_float__ #_rf_close' || '#_rf_close').addEventListener('click', removeFloat);
 
   makeDraggable(bar);
   startFloatTimer();
@@ -459,6 +487,9 @@ function stopFloatTimer() {
   if (CS.floatTimer) { clearInterval(CS.floatTimer); CS.floatTimer = null; }
 }
 
+// ============================================================
+// 拖拽
+// ============================================================
 function makeDraggable(el) {
   let drag = false, sx, sy, ox, oy;
 
