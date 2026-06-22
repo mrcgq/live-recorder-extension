@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "🎬 极简直播内录器 Pro",
-  "version": "3.2.0",
+  "version": "3.2.1",
   "description": "基于跨进程管道化隔离架构的轻量级直录器，0%网页卡顿，100%防崩自愈。",
   "permissions": [
     "activeTab",
@@ -16,7 +16,8 @@
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
-      "run_at": "document_end"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
   "action": {
