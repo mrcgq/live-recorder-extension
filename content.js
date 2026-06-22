@@ -1,7 +1,7 @@
 'use strict';
 
 // ============================================================
-// content.js v4.1 - DOM 树隔离与视口超纯净清洗
+// content.js v4.2 - DOM 树隔离、握手自重连与动态尺寸上报
 // ============================================================
 
 const CS = {
@@ -17,7 +17,7 @@ const CS = {
   observer         : null,
   bindTimeout      : null,
   sanitizedVideo   : null,   // 当前被隔离清洗的视频元素
-  isolatedElements : [],     // 用于完美回滚布局的 DOM 状态备份数组
+  isolatedElements : [],     // 用于完美回退布局的 DOM 状态备份
 };
 
 function fmtTime(s) {
@@ -27,7 +27,7 @@ function fmtTime(s) {
 }
 
 // ============================================================
-// ★ 深度 DOM 树隔离与视口清洗（解决录制多余网页内容的问题）
+// ★ 深度 DOM 树隔离与视口清洗（清洗多余网页内容）
 // ============================================================
 function applyViewportSanitize() {
   const video = pickBestVideo();
@@ -36,7 +36,10 @@ function applyViewportSanitize() {
     return;
   }
 
-  if (CS.sanitizedVideo === video) return;
+  if (CS.sanitizedVideo === video) {
+    reportVideoDimensions();
+    return;
+  }
   CS.sanitizedVideo = video;
   CS.isolatedElements = [];
 
@@ -60,7 +63,7 @@ function applyViewportSanitize() {
   ancestors.add(document.documentElement);
   ancestors.add(document.body);
 
-  // 2. 深度递归遍历树，将所有不属于视频祖先的元素强行 display: none!important 隐藏
+  // 2. 递归隐藏所有非视频祖先节点的元素
   function isolateNode(node) {
     if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
     const tag = node.tagName;
@@ -78,24 +81,21 @@ function applyViewportSanitize() {
       });
 
       node.style.setProperty('display', 'none', 'important');
-      return; // 终止非祖先节点子树的后续遍历
+      return; 
     }
 
-    // 遍历 light DOM 子节点
     if (node.children) {
       Array.from(node.children).forEach(child => isolateNode(child));
     }
 
-    // 深度穿透 Shadow DOM 内部
     if (node.shadowRoot && node.shadowRoot.children) {
       Array.from(node.shadowRoot.children).forEach(child => isolateNode(child));
     }
   }
 
-  // 开始执行全页面 DOM 纯净化清洗
   isolateNode(document.body);
 
-  // 3. 额外隐藏视频容器内除了 video 本身以外的兄弟节点 (如自定义进度条、暂停浮层、同级弹幕层)
+  // 3. 隐藏视频容器内除了 video 本身以外的同级节点 (清理多余的控制条、播放按钮、浮层等)
   if (video.parentElement) {
     Array.from(video.parentElement.children).forEach((sibling) => {
       if (sibling !== video && sibling.tagName !== 'SCRIPT' && sibling.tagName !== 'STYLE' && sibling.tagName !== 'LINK') {
@@ -113,7 +113,7 @@ function applyViewportSanitize() {
     });
   }
 
-  // 4. 清洗并重置所有祖先容器盒模型，移除 Transform、Filter 及 Overflow 剪裁，使视频能完全伸展
+  // 4. 清洗并重置所有祖先容器盒模型，移除限制
   ancestors.forEach((el) => {
     if (el === document.documentElement || el === document.body) {
       CS.isolatedElements.push({
@@ -152,7 +152,7 @@ function applyViewportSanitize() {
     el.style.setProperty('opacity', '1', 'important');
   });
 
-  // 5. 将核心 <video> 直播元素强行拉伸并 fixed 充满整个浏览器视口进行内录
+  // 5. 强行拉伸并置顶 <video> 元素填满视口
   CS.isolatedElements.push({
     el: video,
     type: 'video',
@@ -177,6 +177,9 @@ function applyViewportSanitize() {
   video.style.setProperty('visibility', 'visible', 'important');
 
   console.log('[content] ★ 深度 DOM 纯化清洗隔离已应用，视频已完美满屏');
+
+  // 主动检测视频物理分辨率并进行上报，动态调整外壳窗口尺寸
+  reportVideoDimensions();
 }
 
 // 录制结束后无损还原原本的页面布局
@@ -185,7 +188,6 @@ function removeViewportSanitize() {
 
   console.log('[content] ★ 开始还原网页原本的布局结构...');
 
-  // 逆序还原，保证样式树不产生断层和重叠覆盖
   for (let i = CS.isolatedElements.length - 1; i >= 0; i--) {
     const item = CS.isolatedElements[i];
     try {
@@ -212,6 +214,43 @@ function removeViewportSanitize() {
   CS.sanitizedVideo = null;
   CS.isolatedElements = [];
   console.log('[content] ★ 网页已无损复原');
+}
+
+// ============================================================
+// ★ 获取并上报视频真实像素比例
+// ============================================================
+function reportVideoDimensions() {
+  const video = CS.sanitizedVideo || pickBestVideo();
+  if (!video) return;
+
+  // 优先获取真实的视频物理流像素尺寸
+  const w = video.videoWidth || video.offsetWidth || 1280;
+  const h = video.videoHeight || video.offsetHeight || 720;
+
+  if (w > 100 && h > 100) {
+    chrome.runtime.sendMessage({
+      action: 'resizeIsolatedWindow',
+      width: w,
+      height: h
+    }, () => {
+      void chrome.runtime.lastError;
+    });
+  }
+}
+
+// ============================================================
+// ★ 握手自检机制：重新加载或迁移时自动隔离，避免逻辑中断
+// ============================================================
+function checkAndAutoIsolate() {
+  chrome.runtime.sendMessage({ action: 'checkIfIResultInRecording' }, (resp) => {
+    if (chrome.runtime.lastError) return;
+    if (resp && resp.isRecordingTarget) {
+      console.log('[content] ★ 页面重载或迁移完成，检测到处于录制目标中，重新触发清洗');
+      setTimeout(() => {
+        applyViewportSanitize();
+      }, 500);
+    }
+  });
 }
 
 // ============================================================
@@ -259,52 +298,6 @@ function pickBestVideo() {
   }
   return best;
 }
-
-// ============================================================
-// 消息监听
-// ============================================================
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  switch (msg.action) {
-    case 'applyViewportSanitize':
-      applyViewportSanitize();
-      sendResponse({ ok: true });
-      break;
-
-    case 'removeViewportSanitize':
-      removeViewportSanitize();
-      sendResponse({ ok: true });
-      break;
-
-    case 'showFloat':
-      showFloat(msg.position || 'top-right');
-      sendResponse({ ok: true });
-      break;
-
-    case 'removeFloat':
-      removeFloat();
-      sendResponse({ ok: true });
-      break;
-
-    case 'updateFloat':
-      updateFloat(msg.paused, msg.time);
-      sendResponse({ ok: true });
-      break;
-
-    case 'enableRegionSelect':
-      startRegion();
-      sendResponse({ ok: true });
-      break;
-
-    case 'disableRegionSelect':
-      stopRegion();
-      sendResponse({ ok: true });
-      break;
-
-    default:
-      sendResponse({ ok: false });
-  }
-  return true;
-});
 
 // ============================================================
 // 视频检测 + 悬浮录制栏
@@ -811,7 +804,11 @@ function stopRegion() { CS.regionActive = false; }
 // 启动
 // ============================================================
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', initVideoDetection);
+  document.addEventListener('DOMContentLoaded', () => {
+    initVideoDetection();
+    checkAndAutoIsolate();
+  });
 } else {
   initVideoDetection();
+  checkAndAutoIsolate();
 }
