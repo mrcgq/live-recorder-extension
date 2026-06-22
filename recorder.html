@@ -4,217 +4,158 @@
   <meta charset="UTF-8">
   <title>视频录制</title>
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
+    * { margin:0; padding:0; box-sizing:border-box; }
     body {
-      width: 100vw;
-      height: 100vh;
-      font-family: 'Microsoft YaHei', Arial, sans-serif;
-      background: #121212;
-      color: #fff;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-      user-select: none;
+      width:100vw; height:100vh;
+      font-family:'Microsoft YaHei',Arial,sans-serif;
+      background:#121212; color:#fff;
+      display:flex; flex-direction:column;
+      overflow:hidden; user-select:none;
     }
-
-    /* ===== 顶部虚拟标题栏 ===== */
     .win-header {
-      background: #1e1e1e;
-      padding: 8px 12px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-bottom: 1px solid #333;
+      background:#1e1e1e; padding:8px 12px;
+      display:flex; align-items:center; justify-content:space-between;
+      border-bottom:1px solid #333; flex-shrink:0;
     }
     .win-title {
-      font-size: 13px;
-      font-weight: bold;
-      color: #ccc;
-      display: flex;
-      align-items: center;
-      gap: 6px;
+      font-size:13px; font-weight:bold; color:#ccc;
+      display:flex; align-items:center; gap:6px;
     }
     .rec-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: #ff3b30;
-      animation: pulse 1.2s infinite;
+      width:8px; height:8px; border-radius:50%;
+      background:#ff3b30; animation:pulse 1.2s infinite;
     }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.3; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+    .error-bar {
+      display:none; background:#3a1010;
+      border-bottom:1px solid #e53935;
+      padding:8px 16px; font-size:12px; color:#ff8080;
+      flex-shrink:0;
     }
 
-    /* ===== 中部流式实时预览区 ===== */
     .video-container {
-      flex: 1;
-      background: #000;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      overflow: hidden;
-      position: relative;
+      flex:1; background:#000;
+      display:flex; align-items:center; justify-content:center;
+      overflow:hidden; position:relative; min-height:0;
     }
-    #previewPlayer {
-      max-width: 100%;
-      max-height: 100%;
-      object-fit: contain;
+    #previewPlayer { max-width:100%; max-height:100%; object-fit:contain; }
+    .idle-hint {
+      position:absolute; display:flex; flex-direction:column;
+      align-items:center; gap:12px; color:#3a3a3a; pointer-events:none;
     }
+    .idle-hint .icon { font-size:56px; }
+    .idle-hint p { font-size:14px; color:#3a3a3a; }
 
-    /* ===== 底部控制控制台 ===== */
     .bottom-panel {
-      background: #1a1a1a;
-      border-top: 1px solid #333;
-      padding: 12px 16px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
+      background:#1a1a1a; border-top:1px solid #333;
+      padding:10px 14px;
+      display:flex; align-items:center; justify-content:space-between;
+      gap:12px; flex-shrink:0;
     }
-
-    /* 选项组（左侧） */
-    .preset-group {
-      display: flex;
-      gap: 6px;
-      align-items: center;
-    }
+    .preset-group { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
     .preset-btn {
-      background: #2a2a2a;
-      border: 1px solid #444;
-      color: #ccc;
-      padding: 6px 14px;
-      border-radius: 4px;
-      font-size: 12px;
-      cursor: pointer;
-      font-weight: bold;
-      transition: all 0.2s;
+      background:#2a2a2a; border:1px solid #444; color:#ccc;
+      padding:5px 11px; border-radius:4px; font-size:12px;
+      cursor:pointer; font-weight:bold; transition:all .2s;
+      white-space:nowrap;
     }
-    .preset-btn:hover {
-      border-color: #ff3b30;
-      color: #fff;
-    }
+    .preset-btn:hover { border-color:#ff3b30; color:#fff; }
     .preset-btn.active {
-      background: linear-gradient(135deg, #1565c0, #0d47a1);
-      border-color: #2196f3;
-      color: #fff;
-      box-shadow: 0 0 8px rgba(33, 150, 243, 0.4);
+      background:linear-gradient(135deg,#1565c0,#0d47a1);
+      border-color:#2196f3; color:#fff;
+      box-shadow:0 0 8px rgba(33,150,243,.4);
     }
     .preset-btn.uhd.active {
-      background: linear-gradient(135deg, #6a1b9a, #4a148c);
-      border-color: #9c27b0;
-      box-shadow: 0 0 8px rgba(156, 39, 176, 0.4);
+      background:linear-gradient(135deg,#6a1b9a,#4a148c);
+      border-color:#9c27b0; box-shadow:0 0 8px rgba(156,39,176,.4);
     }
 
-    /* 圆形录制大钮（中侧） */
+    .center-group { display:flex; flex-direction:column; align-items:center; gap:4px; flex-shrink:0; }
     .rec-trigger-btn {
-      width: 48px;
-      height: 48px;
-      border-radius: 50%;
-      border: 3px solid #ff3b30;
-      background: transparent;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transition: all 0.2s;
+      width:52px; height:52px; border-radius:50%;
+      border:3px solid #ff3b30; background:transparent;
+      cursor:pointer; display:flex; align-items:center; justify-content:center;
+      transition:all .3s;
     }
-    .rec-trigger-btn:hover {
-      box-shadow: 0 0 15px rgba(255, 59, 48, 0.5);
-    }
+    .rec-trigger-btn:hover { box-shadow:0 0 18px rgba(255,59,48,.6); }
     .inner-circle {
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      background: #ff3b30;
-      transition: all 0.2s;
+      width:24px; height:24px; border-radius:50%;
+      background:#ff3b30; transition:all .3s;
     }
     .rec-trigger-btn.recording .inner-circle {
-      border-radius: 4px;
-      width: 16px;
-      height: 16px;
+      border-radius:4px; width:18px; height:18px;
     }
+    .rec-label { font-size:10px; color:#888; white-space:nowrap; }
 
-    /* 实时仪表显示面板（右侧） */
+    .right-group { display:flex; flex-direction:column; gap:6px; align-items:flex-end; }
+    #wPause {
+      background:rgba(255,152,0,.12); border:1px solid #ff9800;
+      color:#ff9800; padding:4px 12px; border-radius:5px;
+      cursor:pointer; font-size:11px; font-family:inherit;
+      display:none; transition:background .2s;
+    }
+    #wPause:hover { background:rgba(255,152,0,.25); }
+
     .dashboard {
-      background: #111;
-      border: 1px solid #2d2d2d;
-      border-radius: 6px;
-      padding: 6px 14px;
-      min-width: 280px;
-      font-family: 'Courier New', monospace;
+      background:#111; border:1px solid #2d2d2d;
+      border-radius:6px; padding:6px 14px; min-width:250px;
+      font-family:'Courier New',monospace;
     }
-    .dash-row-top {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 4px;
-    }
-    .dash-timer {
-      font-size: 16px;
-      font-weight: bold;
-      color: #ff3b30;
-      letter-spacing: 1px;
-    }
-    .dash-size {
-      font-size: 13px;
-      font-weight: bold;
-      color: #fff;
-    }
-    .dash-row-bottom {
-      display: flex;
-      gap: 12px;
-      font-size: 10px;
-      color: #888;
-    }
-    .dash-row-bottom span span {
-      color: #4caf50;
-      font-weight: bold;
-    }
+    .dash-top { display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
+    .dash-timer { font-size:16px; font-weight:bold; color:#ff3b30; letter-spacing:1px; }
+    .dash-size  { font-size:13px; font-weight:bold; color:#fff; }
+    .dash-bottom { display:flex; gap:12px; font-size:10px; color:#888; }
+    .dash-bottom span span { color:#4caf50; font-weight:bold; }
   </style>
 </head>
 <body>
 
-  <!-- 顶部虚拟标题栏 -->
   <div class="win-header">
     <div class="win-title">
-      <div class="rec-dot" id="headerRecDot" style="display: none;"></div>
-      <span>视频录制</span>
+      <div class="rec-dot" id="headerRecDot" style="display:none;"></div>
+      <span id="winTitleText">视频录制 — 就绪</span>
     </div>
-    <div style="font-size: 11px; color: #666;">Live Capture Engine</div>
+    <div style="font-size:11px;color:#444;">Live Capture Engine v2.3</div>
   </div>
 
-  <!-- 中部流式实时预览区 -->
+  <div class="error-bar" id="wErrorMsg"></div>
+
   <div class="video-container">
     <video id="previewPlayer" autoplay playsinline muted></video>
+    <div class="idle-hint" id="idleHint">
+      <div class="icon">🎬</div>
+      <p>选择质量预设后，点击红色按钮开始录制</p>
+    </div>
   </div>
 
-  <!-- 底部控制控制台 -->
   <div class="bottom-panel">
-    <!-- 质量切换 -->
     <div class="preset-group">
-      <button class="preset-btn" id="wUHD">超清录制</button>
-      <button class="preset-btn active" id="wHD">高清录制</button>
-      <button class="preset-btn" id="wSD">标清录制</button>
-      <button class="preset-btn" id="wPause" style="color: #ff9800; border-color: #ff9800; display: none;">⏸ 暂停</button>
+      <button class="preset-btn uhd" id="wUHD">超清</button>
+      <button class="preset-btn active"  id="wHD">高清</button>
+      <button class="preset-btn" id="wSD">标清</button>
     </div>
 
-    <!-- 圆形主按钮 -->
-    <button class="rec-trigger-btn" id="wRecBtn">
-      <div class="inner-circle"></div>
-    </button>
+    <div class="center-group">
+      <button class="rec-trigger-btn" id="wRecBtn" title="开始 / 停止录制">
+        <div class="inner-circle"></div>
+      </button>
+      <span class="rec-label" id="wRecLabel">● 开始录制</span>
+    </div>
 
-    <!-- 实时仪表面板 -->
-    <div class="dashboard">
-      <div class="dash-row-top">
-        <div class="dash-timer" id="wTimer">00:00:000</div>
-        <div class="dash-size" id="wSize">0.00 M</div>
-      </div>
-      <div class="dash-row-bottom">
-        <span>CPU: <span id="wCpu">0%</span></span>
-        <span>FPS: <span id="wFps">0</span></span>
-        <span>速率: <span id="wBitrate">0kbps</span></span>
-        <span>分辨率: <span id="wRes">1920x1080</span></span>
+    <div class="right-group">
+      <button id="wPause">⏸ 暂停</button>
+      <div class="dashboard">
+        <div class="dash-top">
+          <div class="dash-timer" id="wTimer">00:00:00</div>
+          <div class="dash-size"  id="wSize">0.00 M</div>
+        </div>
+        <div class="dash-bottom">
+          <span>CPU:<span id="wCpu">0%</span></span>
+          <span>FPS:<span id="wFps">0</span></span>
+          <span>速率:<span id="wBitrate">0kbps</span></span>
+          <span>分辨率:<span id="wRes">-</span></span>
+        </div>
       </div>
     </div>
   </div>
