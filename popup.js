@@ -1,8 +1,7 @@
 'use strict';
 
 // ============================================================
-// popup.js v3.0
-// 核心变更：startRecording 改为通知 content 脚本执行
+// popup.js v3.1 - 主动唤醒重构版
 // ============================================================
 
 const $ = (id) => document.getElementById(id);
@@ -24,7 +23,6 @@ let UI = { quality: 'hd', isRecording: false, isPaused: false };
 let bgPort     = null;
 let _toastTimer = null;
 
-// ── 配置持久化 ────────────────────────────────────────────────
 async function loadConfig() {
   return new Promise((resolve) => {
     chrome.storage.local.get([...PERSISTENT_KEYS, 'quality'], (stored) => {
@@ -53,7 +51,6 @@ function saveConfig() {
   chrome.storage.local.set(cfg);
 }
 
-// ── 后台连接 ─────────────────────────────────────────────────
 function connectBg() {
   try {
     bgPort = chrome.runtime.connect({ name: 'popup' });
@@ -99,7 +96,6 @@ function applyMetrics(msg) {
   updateBtnUI();
 }
 
-// ── 事件绑定 ─────────────────────────────────────────────────
 function bindEvents() {
   $('tab-options').addEventListener('click',  () => switchTab('options'));
   $('tab-files').addEventListener('click',    () => switchTab('files'));
@@ -143,28 +139,40 @@ function bindEvents() {
   if (fp) fp.addEventListener('input', saveConfig);
 }
 
-// ── 录制控制 ─────────────────────────────────────────────────
 function toggleMainRecord() {
   if (UI.isRecording) stopRecording(); else startRecording();
 }
 
+// 物理加固：一键主动唤醒录制。点击 Popup 主按钮时，首先尝试在原直播网页中自动检索 <video> 并强行开启直录，拒绝无谓等待 [纠正 3]
 function startRecording() {
   const config = buildConfig();
 
-  // 打开控制面板窗口（不自动录制，用户需在网页视频上点击）
-  if (bgPort) {
-    bgPort.postMessage({ action: 'startRecording', config });
-  } else {
-    chrome.runtime.sendMessage({ action: 'startRecording', config }, () => {
-      void chrome.runtime.lastError;
-    });
-  }
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    if (!tabs || !tabs[0]) return;
+    const tabId = tabs[0].id;
 
-  toast('🎬 已打开录制控制窗口，请在直播视频上点击「⏺ 开始录制」');
+    // 先行握手，对直播网页进行主动嗅探抓取
+    chrome.tabs.sendMessage(tabId, { action: 'start_recording_now', config }, (response) => {
+      const err = chrome.runtime.lastError;
+
+      if (err || !response || !response.ok) {
+        // 网页无播放器或未就绪：降级唤醒控制窗口（让用户选择 TabCapture）
+        if (bgPort) {
+          bgPort.postMessage({ action: 'startRecording', config });
+        } else {
+          chrome.runtime.sendMessage({ action: 'startRecording', config }, () => {
+            void chrome.runtime.lastError;
+          });
+        }
+        toast('🎬 已打开录制控制窗口');
+      } else {
+        toast('⏺ 极客引擎已成功强行开始直录！');
+      }
+    });
+  });
 }
 
 function stopRecording() {
-  // 发给 background，background 再转发给 content
   if (bgPort) {
     bgPort.postMessage({ action: 'stopRecording' });
   } else {
@@ -213,7 +221,6 @@ function buildConfig() {
   };
 }
 
-// ── 辅助 ─────────────────────────────────────────────────────
 function setQuality(q) {
   UI.quality = q;
   syncQualityBtn(q);
@@ -296,7 +303,6 @@ function switchTab(name) {
   if (p) p.classList.add('active');
 }
 
-// ── 初始化 ────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
   bindEvents();
   await loadConfig();
