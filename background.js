@@ -1,7 +1,14 @@
 'use strict';
 
 // ============================================================
-// Background Service Worker v4.2 - 动态窗口裁剪与自适应隔离版
+// Background Service Worker v3.1
+// 核心变更：
+//   1. 结合 video.captureStream() 纯视频流内录设计。
+//   2. 引入 tabCapture 保活机制 (Wake-lock)：在后台激活一个静默的 
+//      tabCapture 流，强制 Chrome 的合成器与渲染器在后台以 full-frame 运行，
+//      彻底攻克切换标签页/最小化时 video.captureStream() 产生的“花屏/冻结”缺陷！
+//   3. 添加双引擎容灾机制：当 video.captureStream() 因 CORS 报错受限时，
+//      自动无缝降级采用 tabCapture 底层流完成高质量捕获。
 // ============================================================
 
 let recordingState = {
@@ -14,9 +21,6 @@ let recordingState = {
   resolution       : '-',
   timeString       : '00:00:00',
   activeTabId      : null,
-  originalWindowId : null,   // 记录录制前标签页所属的原始窗口 ID
-  originalIndex    : null,   // 记录录制前标签页在原窗口中的索引
-  tempWindowId     : null,   // 临时创建的独立最小化窗口 ID
   recorderWindowId : null,
 };
 
@@ -31,169 +35,11 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onMessage.addListener(handlePopupCommand);
 });
 
-// ============================================================
-// 独立提取与复位逻辑
-// ============================================================
-
-function getTabAsync(tabId) {
-  return new Promise((resolve) => {
-    chrome.tabs.get(tabId, (tab) => {
-      if (chrome.runtime.lastError) resolve(null);
-      else resolve(tab);
-    });
-  });
-}
-
-function queryTabsAsync(queryInfo) {
-  return new Promise((resolve) => {
-    chrome.tabs.query(queryInfo, (tabs) => {
-      if (chrome.runtime.lastError) resolve([]);
-      else resolve(tabs);
-    });
-  });
-}
-
-function createTabAsync(createProperties) {
-  return new Promise((resolve) => {
-    chrome.tabs.create(createProperties, (tab) => {
-      if (chrome.runtime.lastError) resolve(null);
-      else resolve(tab);
-    });
-  });
-}
-
-function createMinWindowAsync(tabId) {
-  return new Promise((resolve) => {
-    chrome.windows.create({
-      tabId: tabId,
-      state: 'minimized',
-      focused: false
-    }, (win) => {
-      if (chrome.runtime.lastError) resolve(null);
-      else resolve(win);
-    });
-  });
-}
-
-// 提取当前目标标签页并将其移入一个独立的最小化窗口中
-async function isolateTabToMinimizedWindow(tabId) {
-  const tab = await getTabAsync(tabId);
-  if (!tab) throw new Error('无法读取目标标签页');
-
-  const originalWindowId = tab.windowId;
-  const originalIndex = tab.index;
-
-  const tabsInWin = await queryTabsAsync({ windowId: originalWindowId });
-  if (tabsInWin.length === 1) {
-    // 防止移动唯一标签页导致原窗口自动关闭，新建一个空白标签页
-    await createTabAsync({ windowId: originalWindowId, active: true });
-  }
-
-  // 创建一个包含目标标签页的新独立窗口，并初始化为最小化状态
-  const newWin = await createMinWindowAsync(tabId);
-  if (!newWin) throw new Error('无法创建最小化的隔离窗口');
-
-  console.log('[bg] ★ 目标标签页已隔离到独立最小化窗口 tempWindowId:', newWin.id);
-
-  recordingState.originalWindowId = originalWindowId;
-  recordingState.originalIndex = originalIndex;
-  recordingState.tempWindowId = newWin.id;
-}
-
-// 录制结束后无损还原标签页
-async function restoreHostWindow() {
-  const { activeTabId, originalWindowId, originalIndex, tempWindowId } = recordingState;
-  
-  if (!activeTabId || !originalWindowId) return;
-
-  console.log('[bg] ★ 正在将目标标签页复原到原始窗口...');
-  
-  try {
-    const origWinExists = await new Promise((resolve) => {
-      chrome.windows.get(originalWindowId, () => {
-        resolve(!chrome.runtime.lastError);
-      });
-    });
-
-    if (origWinExists) {
-      // 挪回原窗口的原位置
-      await new Promise((resolve) => {
-        chrome.tabs.move(activeTabId, { windowId: originalWindowId, index: originalIndex }, () => {
-          resolve();
-        });
-      });
-      // 重新激活并聚焦
-      chrome.tabs.update(activeTabId, { active: true });
-      chrome.windows.update(originalWindowId, { focused: true });
-      console.log('[bg] ★ 标签页已成功复原并聚焦');
-    } else {
-      if (tempWindowId) {
-        chrome.windows.update(tempWindowId, { state: 'normal', focused: true }, () => {
-          void chrome.runtime.lastError;
-        });
-        console.log('[bg] ★ 原始窗口已不存在，已将隔离窗口还原显示');
-      }
-    }
-  } catch (e) {
-    console.error('[bg] 复原标签页失败:', e.message);
-  }
-
-  recordingState.originalWindowId = null;
-  recordingState.originalIndex = null;
-  recordingState.tempWindowId = null;
-}
-
-// 打开/复用录制控制小窗
-async function ensureRecorderWindow(urlParams) {
-  if (recordingState.recorderWindowId) {
-    try {
-      await chrome.windows.update(recordingState.recorderWindowId, { focused: true });
-      return;
-    } catch (_) {
-      recordingState.recorderWindowId = null;
-    }
-  }
-
-  const win = await chrome.windows.create({
-    url    : 'recorder.html?' + new URLSearchParams(urlParams).toString(),
-    type   : 'popup',
-    width  : 900,
-    height : 620,
-    focused: true,
-  });
-
-  recordingState.recorderWindowId = win.id;
-}
-
-// 监听录制小窗被用户直接关闭
-chrome.windows.onRemoved.addListener((windowId) => {
-  if (windowId !== recordingState.recorderWindowId) return;
-  recordingState.recorderWindowId = null;
-
-  if (recordingState.isRecording) {
-    recordingState.isRecording = false;
-    recordingState.isPaused    = false;
-
-    // 清理网页 UI 状态
-    broadcastToTab(recordingState.activeTabId, { action: 'removeViewportSanitize' });
-    broadcastToActiveTab({ action: 'removeFloat' });
-
-    // 还原宿主窗口与标签页
-    restoreHostWindow();
-
-    if (popupPort) {
-      popupPort.postMessage({ action: 'stateSync', state: recordingState });
-    }
-  }
-});
-
-// ============================================================
-// tabCapture StreamId 获取
-// ============================================================
+// ── 获取 tabCapture 独占 streamId ─────────────────────────────
 function getStreamIdForTab(tabId) {
   return new Promise((resolve, reject) => {
     if (!chrome.tabCapture) {
-      reject(new Error('tabCapture 不可用'));
+      reject(new Error('tabCapture 不可用，请确认已声明权限'));
       return;
     }
     chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (streamId) => {
@@ -208,52 +54,91 @@ function getStreamIdForTab(tabId) {
   });
 }
 
-// ============================================================
-// Popup 指令处理
-// ============================================================
+// ── 录制小窗管理 ─────────────────────────────────────────────
+async function ensureRecorderWindow(config, tabId, autoStart, streamId) {
+  if (recordingState.recorderWindowId) {
+    try {
+      await chrome.windows.update(recordingState.recorderWindowId, { focused: true });
+      return;
+    } catch (_) {
+      recordingState.recorderWindowId = null;
+    }
+  }
+
+  const queryParams = new URLSearchParams({
+    tabId    : tabId || '',
+    config   : JSON.stringify(config || {}),
+    autoStart: autoStart ? 'true' : 'false',
+    streamId : streamId || '', // 注入保活与备用捕获使用的 streamId
+  });
+
+  const win = await chrome.windows.create({
+    url    : 'recorder.html?' + queryParams.toString(),
+    type   : 'popup',
+    width  : 900,
+    height : 620,
+    focused: true,
+  });
+
+  recordingState.recorderWindowId = win.id;
+}
+
+// 监听录制窗口被意外关闭 → 通知 content 脚本停止并保存
+chrome.windows.onRemoved.addListener((windowId) => {
+  if (windowId !== recordingState.recorderWindowId) return;
+  recordingState.recorderWindowId = null;
+
+  if (recordingState.isRecording) {
+    recordingState.isRecording = false;
+    recordingState.isPaused    = false;
+    // 通知 content 脚本执行紧急保存
+    if (recordingState.activeTabId) {
+      chrome.tabs.sendMessage(
+        recordingState.activeTabId,
+        { action: 'emergencySave' },
+        () => { void chrome.runtime.lastError; }
+      );
+    }
+    broadcastToTab(recordingState.activeTabId, { action: 'removeFloat' });
+    if (popupPort) popupPort.postMessage({ action: 'stateSync', state: recordingState });
+  }
+});
+
+// ── Popup 指令处理 ────────────────────────────────────────────
 async function handlePopupCommand(msg) {
-  const allowed = ['startRecording', 'stopRecording', 'pauseRecording', 'resumeRecording'];
+  const allowed = ['startRecording','stopRecording','pauseRecording','resumeRecording'];
   if (!allowed.includes(msg.action)) return;
 
   if (msg.action === 'startRecording') {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       if (!tabs || !tabs[0]) return;
-      const tab      = tabs[0];
-      const tabId    = tab.id;
-
+      const tabId = tabs[0].id;
       recordingState.activeTabId = tabId;
 
+      let streamId = '';
       try {
-        // Step 1: 提取目标标签页放入独立最小化窗口
-        await isolateTabToMinimizedWindow(tabId);
-
-        // Step 2: 获取隔离后的 streamId
-        const streamId = await getStreamIdForTab(tabId);
-
-        // Step 3: 通知 content.js 执行深度 DOM 隔离清洗
-        broadcastToTab(tabId, { action: 'applyViewportSanitize' });
-
-        // Step 4: 打开并聚焦录制控制小窗
-        await ensureRecorderWindow({
-          tabId    : tabId,
-          streamId : streamId,
-          config   : JSON.stringify(msg.config || {}),
-          autoStart: 'true',
-        });
+        streamId = await getStreamIdForTab(tabId);
       } catch (e) {
-        console.error('[bg] Popup 启动录制失败:', e.message);
-        await restoreHostWindow();
+        console.warn('[bg] 获取 streamId 失败:', e.message);
       }
-    });
 
+      await ensureRecorderWindow(msg.config || {}, tabId, false, streamId);
+    });
   } else {
+    // 转发给 recorder 窗口
     chrome.runtime.sendMessage({ ...msg, _target: 'recorder' }).catch(() => {});
+    // 同时通知 content 脚本（兜底）
+    if (recordingState.activeTabId) {
+      chrome.tabs.sendMessage(
+        recordingState.activeTabId,
+        { ...msg, _target: 'content_recorder' },
+        () => { void chrome.runtime.lastError; }
+      );
+    }
   }
 }
 
-// ============================================================
-// 文件名消毒
-// ============================================================
+// ── 文件名消毒 ────────────────────────────────────────────────
 function sanitizeFilename(raw) {
   if (!raw || typeof raw !== 'string') return 'recording.webm';
   return raw
@@ -264,52 +149,10 @@ function sanitizeFilename(raw) {
     .slice(0, 200) || 'recording.webm';
 }
 
-// ============================================================
-// 消息路由
-// ============================================================
+// ── 消息路由 ─────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 
-  // ── 1. content 握手：标签页加载时，验证其是否为录制的目标 ──
-  if (req.action === 'checkIfIResultInRecording') {
-    const tabId = sender.tab && sender.tab.id;
-    // 只要有 activeTabId 记录，即判定为该页面是录制隔离的目标
-    const isTarget = !!(tabId && tabId === recordingState.activeTabId);
-    sendResponse({ isRecordingTarget: isTarget });
-    return;
-  }
-
-  // ── 2. 动态调节隔离窗口的尺寸，使视频流完全铺满画面，消除黑边 ──
-  if (req.action === 'resizeIsolatedWindow') {
-    if (recordingState.tempWindowId) {
-      let w = Math.max(360, Math.min(req.width, 3840));
-      let h = Math.max(360, Math.min(req.height, 2160));
-
-      chrome.windows.update(recordingState.tempWindowId, {
-        width: w,
-        height: h
-      }, () => {
-        void chrome.runtime.lastError;
-        console.log(`[bg] ★ 隔离窗口已根据直播流比例重置大小: ${w}x${h}`);
-      });
-    }
-    sendResponse({ ok: true });
-    return;
-  }
-
-  // ── 3. recorder.js 请求 streamId ─────────────────────────────
-  if (req.action === 'getTabStreamId') {
-    const tabId = parseInt(req.tabId);
-    if (!tabId) { sendResponse({ error: 'invalid_tab_id' }); return; }
-
-    recordingState.activeTabId = tabId;
-
-    getStreamIdForTab(tabId)
-      .then(streamId => sendResponse({ streamId }))
-      .catch(e => sendResponse({ error: e.message }));
-    return true;
-  }
-
-  // ── 4. 实时指标回传 ──────────────────────────────────────────
+  // 1. 实时指标回传
   if (req.action === 'metricsUpdate') {
     Object.assign(recordingState, {
       isRecording: req.isRecording,
@@ -334,42 +177,28 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       });
     }
 
-    // 更新当前页面悬浮控制条
-    broadcastToActiveTab({
+    broadcastToTab(recordingState.activeTabId, {
       action: 'updateFloat',
       paused: req.isPaused,
-      time: req.timeString,
+      time  : req.timeString,
     });
 
     sendResponse({ ok: true });
     return;
   }
 
-  // ── 5. 录制状态变更 ──────────────────────────────────────────
+  // 2. 录制状态变更
   if (req.action === 'recordingStateChanged') {
-    const wasRecording = recordingState.isRecording;
     Object.assign(recordingState, req.state);
-
-    if (popupPort) {
-      popupPort.postMessage({ action: 'stateSync', state: recordingState });
-    }
-
+    if (popupPort) popupPort.postMessage({ action: 'stateSync', state: recordingState });
     if (!req.state.isRecording) {
-      // 录制结束：清理网页 UI
-      broadcastToTab(recordingState.activeTabId, { action: 'removeViewportSanitize' });
-      broadcastToActiveTab({ action: 'removeFloat' });
-
-      // 还原宿主窗口与标签页
-      if (wasRecording) {
-        restoreHostWindow();
-      }
+      broadcastToTab(recordingState.activeTabId, { action: 'removeFloat' });
     }
-
     sendResponse({ ok: true });
     return;
   }
 
-  // ── 6. 安全下载 ──────────────────────────────────────────────
+  // 3. 安全下载（唯一入口，含文件名消毒）
   if (req.action === 'triggerDownload') {
     const safeName = sanitizeFilename(req.filename);
     chrome.downloads.download({
@@ -385,14 +214,24 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       }
       sendResponse({ downloadId });
 
+      // 下载完成后回收 Blob 内存
       function onChanged(delta) {
         if (delta.id !== downloadId) return;
         const st = delta.state && delta.state.current;
         if (st === 'complete' || st === 'interrupted') {
           chrome.downloads.onChanged.removeListener(onChanged);
+          // 通知数据持有方释放
           chrome.runtime.sendMessage(
             { _target: 'recorder', action: 'releaseBlobUrl', url: req.url }
           ).catch(() => {});
+          // 同时通知 content 脚本释放
+          if (recordingState.activeTabId) {
+            chrome.tabs.sendMessage(
+              recordingState.activeTabId,
+              { action: 'releaseBlobUrl', url: req.url },
+              () => { void chrome.runtime.lastError; }
+            );
+          }
         }
       }
       chrome.downloads.onChanged.addListener(onChanged);
@@ -400,56 +239,52 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return true;
   }
 
-  // ── 7. content.js 网页悬浮栏触发录制 ─────────────────────────────
+  // 4. content 脚本触发开录（从悬浮栏点击）
   if (req.action === 'startRecordFromContent') {
-    const tab      = sender.tab;
-    const tabId    = tab && tab.id;
-
+    const tabId = sender.tab && sender.tab.id;
     if (!tabId) { sendResponse({ error: 'no_tab_id' }); return; }
-
     recordingState.activeTabId = tabId;
+
     const config = req.config || {};
+    const autoStart = config.autoStart === true;
 
-    (async () => {
-      try {
-        // Step 1: 提取标签页放入独立最小化窗口
-        await isolateTabToMinimizedWindow(tabId);
-
-        // Step 2: 获取隔离后的 streamId
-        const streamId = await getStreamIdForTab(tabId);
-        console.log('[bg] content 路径 streamId 获取成功');
-
-        // Step 3: 通知 content.js 执行深度 DOM 隔离清洗
-        broadcastToTab(tabId, { action: 'applyViewportSanitize' });
-
-        // Step 4: 打开并聚焦录制控制小窗
-        await ensureRecorderWindow({
-          tabId    : tabId,
-          streamId : streamId,
-          config   : JSON.stringify(config),
-          autoStart: 'true',
-        });
-
+    getStreamIdForTab(tabId)
+      .then(async (streamId) => {
+        await ensureRecorderWindow(config, tabId, autoStart, streamId);
         sendResponse({ ok: true });
-      } catch (e) {
-        console.error('[bg] content 路径启动录制失败:', e.message);
-        await restoreHostWindow();
-        sendResponse({ error: e.message });
-      }
-    })();
-
+      })
+      .catch(async (e) => {
+        console.error('[bg] 获取 streamId 失败，尝试降级启动:', e.message);
+        await ensureRecorderWindow(config, tabId, autoStart, '');
+        sendResponse({ ok: true, warn: e.message });
+      });
     return true;
   }
 
-  // ── 8. 显示网页悬浮控制条 ────────────────────────────────────
-  if (req.action === 'showFloat') {
-    const pos = req.position || 'top-right';
-    broadcastToActiveTab({ action: 'showFloat', position: pos });
+  // 5. 容灾降级：CORS 触发时，content 通知 recorder 页面启动 tabCapture 录制
+  if (req.action === 'fallbackToTabCapture') {
+    chrome.runtime.sendMessage({
+      _target: 'recorder',
+      action : 'startTabCaptureRecording',
+      config : req.config
+    }).catch(() => {});
     sendResponse({ ok: true });
     return;
   }
 
-  // ── 9. 系统通知 ──────────────────────────────────────────────
+  // 6. 显示悬浮窗
+  if (req.action === 'showFloat') {
+    const pos = req.position || 'top-right';
+    if (recordingState.activeTabId) {
+      broadcastToTab(recordingState.activeTabId, { action: 'showFloat', position: pos });
+    } else {
+      broadcastToActiveTab({ action: 'showFloat', position: pos });
+    }
+    sendResponse({ ok: true });
+    return;
+  }
+
+  // 7. 系统通知
   if (req.action === 'notify') {
     if (chrome.notifications) {
       chrome.notifications.create('rec_' + Date.now(), {
@@ -463,10 +298,17 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return;
   }
 
-  // ── 10. 悬浮窗控制按钮转发 ────────────────────────────────────
+  // 8. 悬浮窗控制转发
   if (req.action === 'floatPause' || req.action === 'floatStop') {
     const action = req.action === 'floatStop' ? 'stopRecording' : 'pauseRecording';
     chrome.runtime.sendMessage({ _target: 'recorder', action }).catch(() => {});
+    if (recordingState.activeTabId) {
+      chrome.tabs.sendMessage(
+        recordingState.activeTabId,
+        { action, _target: 'content_recorder' },
+        () => { void chrome.runtime.lastError; }
+      );
+    }
     sendResponse({ ok: true });
     return;
   }
@@ -474,6 +316,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   sendResponse({ ok: false });
 });
 
+// ── 工具函数 ─────────────────────────────────────────────────
 function broadcastToTab(tabId, msg) {
   if (!tabId) return;
   chrome.tabs.sendMessage(tabId, msg, () => { void chrome.runtime.lastError; });
